@@ -26,15 +26,21 @@ def harmless(argv):
 
 
 def audit(plan, head):
-    expected = [sys.executable, '-m', 'unittest', 'discover', '-s', str(m.HERE), '-p', 'controls_test.py', '-v']
-    m.require(plan and all(step == expected for step in plan) and len(plan) == 1, 'unsafe file/argv/filter/extra-step selection; zero children')
+    expected = default_plan()
+    m.require(plan == expected, 'unsafe file/argv/filter/extra-step selection; zero children')
     m.require(head == os.environ.get('GITHUB_SHA'), 'preparation wrong head')
     identity = m.source_identity()
     for name, value in identity['driverHashes'].items():
         frozen = subprocess.check_output(['git', 'show', head + ':' + name], cwd=m.ROOT, timeout=10)
         m.require(m.sha(frozen) == value, 'preparation source differs from committed review candidate')
     return {'allStepsAuditedBeforeSpawn': True, 'head': head, 'plan': plan, 'source': identity,
-            'harmlessPrograms': {key: m.sha(value.encode()) for key, value in SAFE_PROGRAMS.items()}}
+            'harmlessPrograms': {key: m.sha(value.encode()) for key, value in SAFE_PROGRAMS.items()},
+            'preparationExecutableHashes': {step[0]: m.sha(Path(step[0]).resolve().read_bytes()) for step in plan}}
+
+
+def default_plan():
+    return [[sys.executable, '-m', 'unittest', 'discover', '-s', str(m.HERE), '-p', 'controls_test.py', '-v'],
+            ['/opt/homebrew/bin/actionlint', '.github/workflows/owned-native32-stack-measurement.yml']]
 
 
 def execute(out, head, plan=None):
@@ -42,20 +48,25 @@ def execute(out, head, plan=None):
     out.mkdir(parents=True, exist_ok=False)
     result = {'rawExit': None, 'spawned': False, 'classification': 'safe synthetic/harmless controls only', 'start': m.stamp()}
     try:
-        plan = plan if plan is not None else [[sys.executable, '-m', 'unittest', 'discover', '-s', str(m.HERE), '-p', 'controls_test.py', '-v']]
+        plan = plan if plan is not None else default_plan()
         evidence = audit(plan, head)  # ALL steps/source identities, before ANY test child.
         m.save(out, 'audit', evidence)
         env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
-        child = m.Owned(plan[0], out, 'controls', env)
-        result['spawned'] = True
-        try:
-            child.child.wait(timeout=50)
-        except subprocess.TimeoutExpired:
-            result['timeout'] = True
-        receipt = child.close()
-        m.save(out, 'controls-process', receipt)
-        result['rawExit'] = receipt['rawExit']
-        m.require(receipt['rawExit'] == 0 and receipt['cleanupVerified'] and not result.get('timeout'), 'safe controls failed or cleanup unverified')
+        result['steps'] = []
+        for role, argv in zip(('controls', 'workflow-lint'), plan):
+            child = m.Owned(argv, out, role, env)
+            result['spawned'] = True
+            try:
+                child.child.wait(timeout=50)
+            except subprocess.TimeoutExpired:
+                result['timeout'] = role
+            finally:
+                receipt = child.close()
+                m.save(out, role + '-process', receipt)
+                result['rawExit'] = receipt['rawExit']
+                result['steps'].append(receipt)
+            m.require(receipt['rawExit'] == 0 and receipt['cleanupVerified'] and not result.get('timeout'), 'safe controls failed or cleanup unverified')
+        m.require(all(m.sha(Path(path).resolve().read_bytes()) == value for path, value in evidence['preparationExecutableHashes'].items()), 'preparation executable identity drift')
     except BaseException as error:
         result['error'] = repr(error)
     finally:

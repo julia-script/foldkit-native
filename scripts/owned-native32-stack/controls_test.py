@@ -54,6 +54,21 @@ class Controls(unittest.TestCase):
                 source.assert_not_called()
                 spawn.assert_not_called()
 
+    def test_wrong_head_and_modified_safe_source_stop_before_children(self):
+        with patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}), patch.object(m, 'source_identity') as source:
+            with self.assertRaisesRegex(RuntimeError, 'wrong head'):
+                safe.audit(safe.default_plan(), 'b' * 40)
+            source.assert_not_called()
+        identity = {'driverHashes': {'scripts/owned-native32-stack/controls_test.py': 'a' * 64}}
+        with patch.dict(os.environ, {'GITHUB_SHA': 'a' * 40}), patch.object(m, 'source_identity', return_value=identity), \
+             patch.object(subprocess, 'check_output', return_value=b'modified uncommitted source'):
+            with self.assertRaisesRegex(RuntimeError, 'committed review candidate'):
+                safe.audit(safe.default_plan(), 'a' * 40)
+        with patch.object(m, 'Owned') as spawn:
+            self.assertEqual(safe.execute(self.out, 'ignored', [['bun', 'test']]), 1)
+            spawn.assert_not_called()
+        self.assertFalse(json.loads((self.out / 'result.json').read_text())['spawned'])
+
     def test_safe_harmless_argv_source_allowlist_rejects_native_and_modified_program(self):
         for argv in (['bun', 'test'], [sys.executable, '-c', 'import ctypes; ctypes.CDLL("gpuix.node")'],
                      [sys.executable, '-c', safe.SAFE_PROGRAMS['success'], 'extra'],
@@ -174,6 +189,16 @@ class Controls(unittest.TestCase):
         self.assertFalse(receipt['cleanupVerified'])
         self.assertIn('spawn failure', receipt['spawnOrIdentityError'])
 
+    def test_sampler_permission_spawn_failure_is_separate_and_honest(self):
+        self.out.mkdir()
+        with self.assertRaises(PermissionError):
+            m.Owned(['never-executed-sample'], self.out, 'sampler', os.environ.copy(), factory=lambda *a, **k: (_ for _ in ()).throw(PermissionError('synthetic denied permission')))
+        receipt = json.loads((self.out / 'sampler-process.json').read_text())
+        self.assertIsNone(receipt['rawExit'])
+        self.assertFalse(receipt['cleanupVerified'])
+        self.assertIn('PermissionError', receipt['spawnOrIdentityError'])
+        self.assertFalse((self.out / 'original-process.json').exists())
+
     def test_unknown_cleanup_member_fails_honestly_without_signal(self):
         obj = object.__new__(m.Owned)
         obj.child = type('Child', (), {'pid': 99991})()
@@ -222,7 +247,8 @@ class Controls(unittest.TestCase):
             release = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'julia-script/foldkit-native',
                        'GITHUB_REF': 'refs/heads/julia/owned-native32-stack-measurement',
                        'GITHUB_EVENT_NAME': 'push', 'GITHUB_RUN_ATTEMPT': '1'}
-            with patch.dict(os.environ, release), patch.object(os, 'uname', return_value=type('OS', (), {'sysname': 'Darwin'})()), \
+            clean_env = {key: value for key, value in os.environ.items() if key not in ('FOLDKIT_NATIVE_NO_WINDOW', 'NAPI_RS_NATIVE_LIBRARY_PATH', 'BUN_PRELOAD', 'NODE_OPTIONS')}
+            with patch.dict(os.environ, {**clean_env, **release}, clear=True), patch.object(os, 'uname', return_value=type('OS', (), {'sysname': 'Darwin'})()), \
                  patch.object(m, 'source_identity', return_value=source), patch.object(m, 'dependency_identity', return_value=deps), \
                  patch.object(m, 'read_command', side_effect=lambda argv: '1.3.9' if argv[0] == 'bun' else 'v22.22.3' if argv[0] == 'node' else 'synthetic nm'), \
                  patch.object(m, 'Owned', FakeChild):
