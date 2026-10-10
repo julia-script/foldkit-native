@@ -30,16 +30,16 @@ def validate_control(out):
                          before['probe']['pid'] == after['probe']['pid'] == rows[0]['pid'], 'wrong contrast child')
         original.require(before['probe'] == after['probe'] and before['probe']['windowId'] > 0 and
                          before['window'] == after['window'] == row['window'] and
-                         before['regions'] == after['regions'] and before['styles'] == after['styles'] and
+                         before['regions'] == after['regions'] and before['styles'] == after['styles'] and before['app'] == after['app'] and
                          before['count'] == after['count'] == shot['count'] == count and
                          after['frames'] >= before['frames'] > 0 and 0 <= after['at'] - before['at'] <= 5000,
                          'stale scene/style/geometry')
         if count == 0:
             original.require(initial['styles'] == before['styles'], 'initial styles differ from captured original control state')
-            first_probe, first_regions = before['probe'], before['regions']
+            first_probe, first_regions, first_app = before['probe'], before['regions'], before['app']
         else:
             original.require(before['probe'] == first_probe and
-                             [r['bounds'] for r in before['regions']] == [r['bounds'] for r in first_regions],
+                             [r['bounds'] for r in before['regions']] == [r['bounds'] for r in first_regions] and before['app'] == first_app,
                              'owned window/regions moved between counter captures')
         styles = after['styles']
         original.require([v['selector'] for v in styles] == ['html', 'body', '.app', 'p', 'button'] and
@@ -50,8 +50,16 @@ def validate_control(out):
                          shot['width'] == row['screenshot']['width'] == after['window']['width'] * shot['scale'] and
                          shot['height'] == row['screenshot']['height'] == after['window']['height'] * shot['scale'], 'wrong logical/device scale')
         original.require(shot['pngSHA256'] == original.sha((out / f'count-{count}.png').read_bytes()), 'contrast PNG receipt differs from actual image')
-        original.require([r['label'] for r in shot['samples']] == ['app', f'Count: {count}', '+1'], 'missing contrast region')
-        for sample, region in zip(shot['samples'], after['regions']):
+        original.require([r['label'] for r in shot['samples']] == [r['label'] for r in after['regions']] == ['body', f'Count: {count}', '+1'], 'missing contrast region')
+        app = after['app']
+        box = app['bounds']
+        original.require(app['id'] == styles[2]['id'] > 0 and all(math.isfinite(v) for v in box.values()) and
+                         box['width'] > 0 and box['height'] > 0 and shot['app'] == app, 'missing/wrong raw app diagnostic')
+        overflow = {'left': max(0, -box['x']), 'top': max(0, -box['y']),
+                    'right': max(0, box['x'] + box['width'] - after['window']['width']),
+                    'bottom': max(0, box['y'] + box['height'] - after['window']['height'])}
+        original.require(shot['appOverflow'] == overflow, 'raw app overflow diagnostic differs')
+        for index, (sample, region) in enumerate(zip(shot['samples'], after['regions'])):
             box, scale = region['bounds'], shot['scale']
             original.require(all(math.isfinite(v) for v in box.values()) and box['width'] > 0 and box['height'] > 0 and
                              box['x'] >= 0 and box['y'] >= 0 and box['x'] + box['width'] <= after['window']['width'] and
@@ -59,12 +67,12 @@ def validate_control(out):
             device = {'left': math.ceil(box['x'] * scale), 'top': math.ceil(box['y'] * scale),
                       'right': math.floor((box['x'] + box['width']) * scale), 'bottom': math.floor((box['y'] + box['height']) * scale)}
             area = (device['right'] - device['left']) * (device['bottom'] - device['top'])
-            original.require(sample['id'] == region['id'] > 0 and sample['bounds'] == region['bounds'] and
+            original.require(sample['id'] == region['id'] == styles[[1, 3, 4][index]]['id'] > 0 and sample['bounds'] == region['bounds'] and
                              sample['device'] == device and sample['area'] == area > 0 and
                              sample['white'] > 100 and sample['white'] / sample['area'] > .5 and
                              original.re.fullmatch('[0-9a-f]{64}', sample['inkSHA256']) and
                              0 <= sample['dark'] <= area and sample['dark'] + sample['white'] <= area, 'missing measured white region')
-            if sample['label'] != 'app':
+            if sample['label'] != 'body':
                 original.require(sample['dark'] >= 10 and sample['dark'] / sample['area'] < .5, 'missing measured foreground')
         shots.append(shot)
     original.require(shots[0]['samples'][1]['inkSHA256'] != shots[1]['samples'][1]['inkSHA256'],

@@ -194,9 +194,17 @@ class ControlReceipt(unittest.TestCase):
         for count, row in enumerate([self.rows[1], self.rows[3]]):
             row['window'] = {'width': 800, 'height': 600}
             styles = [{'selector': s, 'id': i+1, 'color': '#000000', 'background': '#ffffff' if s in ('body', '.app') else '', 'text': f'Count: {count}' if s == 'p' else '+1' if s == 'button' else '', 'ancestors': []} for i, s in enumerate(['html', 'body', '.app', 'p', 'button'])]
-            regions = [{'label': label, 'id': i+1, 'bounds': {'x': 10, 'y': 10+30*i, 'width': 100, 'height': 20}} for i, label in enumerate(['app', f'Count: {count}', '+1'])]
-            context = {'pid': 123, 'count': count, 'at': 100, 'frames': 4+count*4, 'window': row['window'], 'probe': {'pid': 123, 'windowId': 5, 'scale': 1}, 'styles': styles, 'regions': regions}
-            shot = {'pid': 123, 'count': count, 'scale': 1, 'width': 800, 'height': 600, 'pngSHA256': original.sha((self.out / f'count-{count}.png').read_bytes()), 'samples': [{**r, 'device': {'left': 10, 'top': 10+30*i, 'right': 110, 'bottom': 30+30*i}, 'white': 1500, 'dark': 50, 'area': 2000, 'inkSHA256': str(count if i == 1 else 0)*64} for i, r in enumerate(regions)]}
+            regions = [{'label': label, 'id': [2, 4, 5][i], 'bounds': {'x': 10, 'y': 10+30*i, 'width': 100, 'height': 20}} for i, label in enumerate(['body', f'Count: {count}', '+1'])]
+            regions[0]['bounds'] = {'x': 0, 'y': 0, 'width': 800, 'height': 600}
+            app = {'id': 3, 'bounds': {'x': 24, 'y': 24, 'width': 800, 'height': 112}}
+            context = {'pid': 123, 'count': count, 'at': 100, 'frames': 4+count*4, 'window': row['window'], 'probe': {'pid': 123, 'windowId': 5, 'scale': 1}, 'styles': styles, 'regions': regions, 'app': app}
+            samples = []
+            for i, region in enumerate(regions):
+                box = region['bounds']; area = box['width'] * box['height']
+                samples.append({**region, 'device': {'left': box['x'], 'top': box['y'], 'right': box['x']+box['width'], 'bottom': box['y']+box['height']},
+                                'white': area-50, 'dark': 50, 'area': area, 'inkSHA256': str(count if i == 1 else 0)*64})
+            shot = {'pid': 123, 'count': count, 'scale': 1, 'width': 800, 'height': 600, 'pngSHA256': original.sha((self.out / f'count-{count}.png').read_bytes()), 'samples': samples,
+                    'app': app, 'appOverflow': {'left': 0, 'top': 0, 'right': 24, 'bottom': 0}}
             self.contexts.append(context); self.shots.append(shot)
         original.save(self.out, 'initial-styles', {'case': 'control', 'pid': 123, 'styles': self.contexts[0]['styles']})
 
@@ -212,6 +220,23 @@ class ControlReceipt(unittest.TestCase):
         runner.validate_control(self.out)
 
     def test_positive_contrast_receipt(self): self.contrast_validate()
+
+    def test_measured_body_receipt_preserves_overflow_and_rejects_wrong_body_label_or_app_diagnostic(self):
+        self.contrast_validate()
+        self.assertEqual(self.shots[0]['samples'][0]['label'], 'body')
+        self.assertEqual(self.shots[0]['app']['bounds']['x'] + self.shots[0]['app']['bounds']['width'], 824)
+        self.assertEqual(self.shots[0]['appOverflow']['right'], 24)
+        mutations = [lambda c, s: c[0]['regions'].pop(0), lambda c, s: c[0]['regions'][0].update(id=3),
+                     lambda c, s: c[0]['regions'][0]['bounds'].update(width=801), lambda c, s: c[0]['regions'][0]['bounds'].update(x=-1),
+                     lambda c, s: c[0]['regions'][0].update(label='app'), lambda c, s: c[0]['styles'][1].update(background=''),
+                     lambda c, s: c[0]['regions'][1]['bounds'].update(x=750), lambda c, s: c[0]['regions'][2]['bounds'].update(y=590),
+                     lambda c, s: c[0].pop('app'), lambda c, s: c[0]['app'].update(id=99),
+                     lambda c, s: s[0]['appOverflow'].update(right=0), lambda c, s: s[0]['samples'][0].update(white=0)]
+        for index, mutate in enumerate(mutations):
+            contexts, shots = copy.deepcopy(self.contexts), copy.deepcopy(self.shots)
+            mutate(contexts, shots)
+            with self.subTest(fault=index), self.assertRaises((RuntimeError, KeyError, IndexError)):
+                self.contrast_validate(contexts, shots)
 
     def test_missing_wrong_style_scene_scale_region_foreground_or_stale_pixels_reject(self):
         for mutate in [lambda c, s: c[0]['styles'].clear(), lambda c, s: c[0]['styles'][1].update(background=''), lambda c, s: c[0]['styles'][3].update(text='wrong'), lambda c, s: s[0].update(scale=2), lambda c, s: c[0]['probe'].update(pid=999), lambda c, s: c[0].update(frames=0), lambda c, s: s[0]['samples'].clear(), lambda c, s: s[0]['samples'][1].update(dark=0), lambda c, s: s[0]['samples'][1].update(white=0), lambda c, s: s[1]['samples'][1].update(inkSHA256=s[0]['samples'][1]['inkSHA256'])]:

@@ -7,7 +7,8 @@ type App = ReturnType<typeof mountGpuix>
 type Box = { x: number; y: number; width: number; height: number }
 type Size = { width: number; height: number }
 export type Probe = { pid: number; windowId: number; scale: number; window: Box; display: Box }
-export type Context = { pid: number; count: number; at: number; frames: number; window: Size; probe: Probe; styles: ReturnType<typeof styles>; regions: Array<{ label: string; id: number; bounds: Box }> }
+type Region = { label: string; id: number; bounds: Box }
+export type Context = { pid: number; count: number; at: number; frames: number; window: Size; probe: Probe; styles: ReturnType<typeof styles>; regions: Array<Region>; app: { id: number; bounds: Box } }
 type Image = { width: number; height: number; pixel(x: number, y: number): Array<number> }
 
 export function styles(app: App) {
@@ -36,8 +37,8 @@ export function sameScene(before: Context, after: Context) {
   assert(before.probe.windowId > 0 && before.probe.windowId === after.probe.windowId, 'changed owned window')
   assert(before.frames > 0 && after.frames >= before.frames, 'stale completed frame')
   assert(after.at >= before.at && after.at - before.at <= 5000, 'stale capture context')
-  assert.deepEqual({ count: after.count, window: after.window, styles: after.styles, regions: after.regions, probe: after.probe },
-    { count: before.count, window: before.window, styles: before.styles, regions: before.regions, probe: before.probe }, 'scene/style/window/display changed during capture')
+  assert.deepEqual({ count: after.count, window: after.window, styles: after.styles, regions: after.regions, probe: after.probe, app: after.app },
+    { count: before.count, window: before.window, styles: before.styles, regions: before.regions, probe: before.probe, app: before.app }, 'scene/style/window/display changed during capture')
 }
 
 function deviceRegion(box: Box, size: Size, scale: number) {
@@ -53,9 +54,11 @@ export function pixels(image: Image, context: Context) {
   const scale = context.probe.scale
   assert(Number.isFinite(scale) && scale > 0 && [image.width, image.height].every(v => Number.isInteger(v) && v > 0), 'invalid measured scale/image')
   assert(image.width === context.window.width * scale && image.height === context.window.height * scale, 'PNG/native logical dimensions differ at measured scale')
-  assert.deepEqual(context.regions.map(v => v.label), ['app', `Count: ${context.count}`, '+1'], 'missing/wrong native regions')
-  const samples = context.regions.map(({ label, id, bounds }) => {
-    assert(id > 0, 'missing native region ID')
+  assert.deepEqual(context.regions.map(v => v.label), ['body', `Count: ${context.count}`, '+1'], 'missing/wrong native regions')
+  assert(context.app.id > 0 && context.app.id === context.styles.find(v => v.selector === '.app')?.id &&
+    Object.values(context.app.bounds).every(Number.isFinite) && context.app.bounds.width > 0 && context.app.bounds.height > 0, 'missing/wrong raw app diagnostic')
+  const samples = context.regions.map(({ label, id, bounds }, index) => {
+    assert(id > 0 && id === context.styles.find(v => v.selector === ['body', 'p', 'button'][index])?.id, 'missing/wrong native region ID')
     const region = deviceRegion(bounds, context.window, scale)
     assert(region.right > region.left && region.bottom > region.top, 'empty device region')
     let white = 0, dark = 0
@@ -71,21 +74,32 @@ export function pixels(image: Image, context: Context) {
     const area = (region.right - region.left) * (region.bottom - region.top)
     // Labels need both foreground and background; an unrelated varied pixel is insufficient.
     assert(white > 100 && white / area > .5, `missing white background in ${label}`)
-    if (label !== 'app') assert(dark >= 10 && dark / area < .5, `missing contrasting foreground in ${label}`)
+    if (label !== 'body') assert(dark >= 10 && dark / area < .5, `missing contrasting foreground in ${label}`)
     return { label, id, bounds, device: region, white, dark, area, inkSHA256: ink.digest('hex') }
   })
-  return { pid: context.pid, count: context.count, scale, width: image.width, height: image.height, samples }
+  // The app may overflow BODY; retain its actual box rather than sample a
+  // guessed intersection. Only the explicit measured BODY owns this backdrop.
+  const box = context.app.bounds
+  const appOverflow = { left: Math.max(0, -box.x), top: Math.max(0, -box.y),
+    right: Math.max(0, box.x + box.width - context.window.width), bottom: Math.max(0, box.y + box.height - context.window.height) }
+  return { pid: context.pid, count: context.count, scale, width: image.width, height: image.height, samples, app: context.app, appOverflow }
 }
 
 export function context(app: App, renderer: { getElementBounds(id: number): Box | null; getWindowSize(): Size; getDebugFrameOverlayStats(): { frames: number } }, count: number, probe: Probe): Context {
   const values = styles(app)
-  const regions = ['.app', 'p', 'button'].map((selector, i) => {
+  assert(app.document.querySelector('body') === app.document.body, 'wrong BODY element')
+  const regions = ['body', 'p', 'button'].map((selector, i) => {
     const element = app.document.querySelector(selector)!
+    assert(element.nativeId > 0, `missing native ID: ${selector}`)
     const bounds = renderer.getElementBounds(element.nativeId)
     assert(bounds !== null, `missing native bounds: ${selector}`)
-    return { label: ['app', `Count: ${count}`, '+1'][i]!, id: element.nativeId, bounds }
+    return { label: ['body', `Count: ${count}`, '+1'][i]!, id: element.nativeId, bounds }
   })
-  return { pid: process.pid, count, at: Date.now(), frames: renderer.getDebugFrameOverlayStats().frames, window: renderer.getWindowSize(), probe, styles: values, regions }
+  const appId = app.document.querySelector('.app')!.nativeId
+  assert(appId > 0, 'missing raw app ID')
+  const appBounds = renderer.getElementBounds(appId)
+  assert(appBounds !== null, 'missing raw app bounds')
+  return { pid: process.pid, count, at: Date.now(), frames: renderer.getDebugFrameOverlayStats().frames, window: renderer.getWindowSize(), probe, styles: values, regions, app: { id: appId, bounds: appBounds } }
 }
 
 export function measure(probePath: string): Probe {
