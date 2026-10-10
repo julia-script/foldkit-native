@@ -23,6 +23,7 @@ function fixture(t) {
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
   mkdirSync(resolve(cwd, '.changeset'))
   writeFileSync(resolve(cwd, 'package.json'), JSON.stringify(pkg))
+  writeFileSync(resolve(cwd, 'package-lock.json'), JSON.stringify({ name: pkg.name, version: pkg.version, packages: { '': pkg } }))
   writeFileSync(resolve(cwd, 'CHANGELOG.md'), log)
   const eventPath = resolve(cwd, 'event.json')
   writeFileSync(eventPath, JSON.stringify(event()))
@@ -156,6 +157,13 @@ test('bad tags, releases, dirty checkouts and non-workflow invocations fail with
   assert.throws(() => publish({ ...f, execute: (file, args) => args[0] === 'status' ? ' M package.json' : f.execute(file, args) }), /clean/)
   assert.throws(() => publish({ ...f, env: { ...f.env, GITHUB_EVENT_NAME: 'push' } }), /workflow_run/)
   assert.throws(() => publish({ ...f, env: { ...f.env, GITHUB_SHA: older } }), /context SHA/)
+  assert.equal(f.writes.length, 0)
+})
+
+test('a mismatched root lockfile blocks release before any GitHub mutation', t => {
+  const f = fixture(t)
+  writeFileSync(resolve(f.cwd, 'package-lock.json'), JSON.stringify({ name: pkg.name, version: '0.1.0', packages: { '': pkg } }))
+  assert.throws(() => publish(f), /lockfile version differs/)
   assert.equal(f.writes.length, 0)
 })
 

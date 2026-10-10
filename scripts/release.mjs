@@ -69,6 +69,9 @@ export function releasePlan(cwd = process.cwd()) {
   const pkg = JSON.parse(readFileSync(resolve(cwd, 'package.json'), 'utf8'))
   if (pkg.name !== 'foldkit-native' || pkg.private !== true || pkg.workspaces ||
       !versionPattern.test(pkg.version)) throw new Error('Unexpected source-release topology or version')
+  const lock = JSON.parse(readFileSync(resolve(cwd, 'package-lock.json'), 'utf8'))
+  if (lock.name !== pkg.name || lock.version !== pkg.version ||
+      lock.packages?.['']?.version !== pkg.version) throw new Error('Root lockfile version differs')
   const changesets = readdirSync(resolve(cwd, '.changeset'))
     .filter(name => name.endsWith('.md') && name !== 'README.md')
   if (changesets.length) throw new Error('Pending changesets must be consumed in a version PR')
