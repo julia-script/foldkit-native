@@ -51,7 +51,10 @@ def execute(out, head, plan=None):
         plan = plan if plan is not None else default_plan()
         evidence = audit(plan, head)  # ALL steps/source identities, before ANY test child.
         m.save(out, 'audit', evidence)
-        env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'}
+        cases = out / 'control-cases'
+        cases.mkdir(exist_ok=False)
+        env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
+               'FOLDKIT_NATIVE32_SAFE_CONTROLS_EVIDENCE': str(cases)}
         result['steps'] = []
         for role, argv in zip(('controls', 'workflow-lint'), plan):
             child = m.Owned(argv, out, role, env)

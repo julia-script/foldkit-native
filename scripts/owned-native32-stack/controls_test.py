@@ -37,11 +37,20 @@ def receipts():
 
 class Controls(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.out = Path(self.temp.name) / 'evidence'
+        self.temp = None
+        saved = os.environ.get('FOLDKIT_NATIVE32_SAFE_CONTROLS_EVIDENCE')
+        if saved:
+            case = Path(saved).resolve() / self._testMethodName
+            m.require(not case.is_relative_to(m.ROOT), 'safe case evidence must be outside checkout')
+            case.mkdir(exist_ok=False)
+        else:
+            self.temp = tempfile.TemporaryDirectory()
+            case = Path(self.temp.name)
+        self.out = case / 'evidence'
 
     def tearDown(self):
-        self.temp.cleanup()
+        if self.temp:
+            self.temp.cleanup()
 
     def test_safe_plan_audits_all_before_first_child_and_rejects_extra_unsafe_step(self):
         expected = [sys.executable, '-m', 'unittest', 'discover', '-s', str(m.HERE), '-p', 'controls_test.py', '-v']
@@ -154,7 +163,7 @@ class Controls(unittest.TestCase):
     def spawn_harmless(self, program, role):
         self.out.mkdir(exist_ok=True)
         argv = [sys.executable, '-c', safe.SAFE_PROGRAMS[program]]
-        safe.harmless(argv)  # Explicit source/argv allowlist before each child.
+        m.save(self.out, role + '-allowlist', safe.harmless(argv))  # Before each child.
         return m.Owned(argv, self.out, role, {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
 
     def test_real_harmless_natural_zero_and_raw_failure_owned_cleanup(self):
@@ -162,6 +171,7 @@ class Controls(unittest.TestCase):
             child = self.spawn_harmless(program, program)
             child.child.wait(timeout=5)
             receipt = child.close()
+            m.save(self.out, program + '-process', receipt)
             self.assertEqual(receipt['rawExit'], expected)
             self.assertTrue(receipt['cleanupVerified'], receipt)
             self.assertFalse(receipt['survivors'])
@@ -175,6 +185,7 @@ class Controls(unittest.TestCase):
                 child.observe()
             finally:
                 receipt = child.close()
+                m.save(self.out, program + '-process', receipt)
             self.assertEqual(receipt['rawExit'], -15)
             self.assertTrue(receipt['cleanupVerified'], receipt)
             self.assertFalse(receipt['survivors'])
