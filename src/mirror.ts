@@ -994,6 +994,8 @@ export const createMirror = (options: {
 
   const forget = (node: Node) => {
     hoverListeners.delete(node)
+    told.delete(node)
+    if (hovered === node) hovered = undefined
     const id = ids.get(node)
     if (id !== undefined) {
       ids.delete(node)

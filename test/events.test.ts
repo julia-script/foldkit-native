@@ -876,6 +876,10 @@ describe('hover during a press', () => {
     expect(mounted.idOf(target)).not.toBe(id)
     expect(mounted.nativeOf(target).listeners.has('mouseEnter')).toBe(true)
     mounted.gpui.setBounds(mounted.idOf(target), { x: 100, y: 0, width: 100, height: 100 })
+    // A recreated native element's first enter is fresh, not a late copy.
+    seen.length = 0
+    expect(mounted.send(target, { eventType: 'mouseEnter', ...at(150), hovered: true })).toBe(true)
+    expect(seen).toContain('mouseenter@1')
     mounted.send(source, { eventType: 'mouseDown', ...at(50), button: 0 })
     seen.length = 0
     mounted.send(source, { eventType: 'mouseMove', ...at(150), pressedButton: 0 })
