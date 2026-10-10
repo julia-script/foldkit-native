@@ -22,13 +22,17 @@ def group_members(pgid):
             if int(group) == pgid and not state.startswith("Z")]
 
 
-def supervise(command, raw_path, env, deadline=60):
+def supervise(command, raw_path, env, deadline=60, state=None):
     started = time.monotonic()
+    state = {} if state is None else state
+    state.update(returncode=None, deadlineExceeded=False, reaped=False, groupClean=False,
+                 started=False, signals=[], command=command, envelopeSeconds=deadline)
     with open(raw_path, "w") as output:
         child = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT,
                                  env=env, start_new_session=True)
+        state.update(started=True, pid=child.pid, pgid=child.pid)
         exceeded = False
-        signals = []
+        signals = state["signals"]
         def send(sig):
             try:
                 os.killpg(child.pid, sig)
@@ -47,6 +51,7 @@ def supervise(command, raw_path, env, deadline=60):
                 child.wait(timeout=deadline)
             except subprocess.TimeoutExpired:
                 exceeded = True
+                state["deadlineExceeded"] = True
                 send(signal.SIGTERM)
                 try:
                     child.wait(timeout=2)
@@ -55,18 +60,24 @@ def supervise(command, raw_path, env, deadline=60):
                     child.wait(timeout=5)
         finally:
             # Includes grandchildren retained after the original child exits.
-            send(signal.SIGKILL)
-            child.wait(timeout=5)
+            try:
+                send(signal.SIGKILL)
+                child.wait(timeout=5)
+            finally:
+                # Preserve a known raw exit even if signalling/reaping fails.
+                state.update(returncode=child.returncode, reaped=child.returncode is not None,
+                             elapsedSeconds=time.monotonic() - started)
         cleanup_deadline = time.monotonic() + 2
         members = group_members(child.pid)
         while members and time.monotonic() < cleanup_deadline:
             time.sleep(0.02)
             members = group_members(child.pid)
-    return {"returncode": child.returncode, "deadlineExceeded": exceeded,
+    state.update({"returncode": child.returncode, "deadlineExceeded": exceeded,
             "reaped": child.poll() is not None, "groupClean": not members,
             "remainingGroupMembers": members, "signals": signals,
             "pid": child.pid, "pgid": child.pid, "envelopeSeconds": deadline,
-            "elapsedSeconds": time.monotonic() - started, "command": command}
+            "elapsedSeconds": time.monotonic() - started, "command": command})
+    return state
 
 
 def main():
@@ -77,8 +88,44 @@ def main():
     os.chdir(root)
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=False)
+    profile_path = out / "profile.json"
+    raw_path = out / "original.log"
+    raw_path.write_text("")
+    profile_path.write_text(json.dumps({"stage": "unavailable", "reason": "no child profile available"}) + "\n")
+    provenance = {"stage": "startup", "head": None, "base": BASE}
+    supervision = {"started": False, "returncode": None, "deadlineExceeded": False,
+                   "reaped": False, "groupClean": False}
+    result = {"completeEvidence": False, "problems": ["startup incomplete"],
+              "originalResult": "unproved", "originalExit": None}
+    def write(name, value):
+        (out / name).write_text(json.dumps(value, indent=2) + "\n")
+    write("provenance.json", provenance)
+    write("supervision.json", supervision)
+    write("validation.json", result)
+    write("error.json", {"stage": "startup", "failure": None})
+    try:
+        return execute(root, out, provenance, supervision, write)
+    except Exception as error:
+        failure = {"stage": provenance["stage"], "type": type(error).__name__, "message": str(error)[:2000]}
+        provenance["failure"] = failure
+        supervision["failure"] = failure
+        result = {"completeEvidence": False, "problems": ["profile execution failed: " + failure["type"] + ": " + failure["message"]],
+                  "originalResult": "unproved", "originalExit": supervision.get("returncode"),
+                  "supervisorDeadlineExceeded": supervision.get("deadlineExceeded")}
+        write("error.json", failure)
+        write("provenance.json", provenance)
+        write("supervision.json", supervision)
+        write("validation.json", result)
+        print(json.dumps(result))
+        original = supervision.get("returncode")
+        return original if isinstance(original, int) and original > 0 else 1
+
+
+def execute(root, out, provenance, supervision, write):
+    provenance["stage"] = "preflight"
     git = lambda *args: subprocess.check_output(["git", *args], text=True).strip()
     head = git("rev-parse", "HEAD")
+    provenance["head"] = head
     git("merge-base", "--is-ancestor", BASE, head)
     changed = git("diff", "--name-only", BASE, head).splitlines()
     allowed = lambda name: name.startswith("scripts/pixel-art-drag-profile/") or name == ".github/workflows/pixel-art-drag-phase-profile.yml"
@@ -102,10 +149,11 @@ def main():
            "PIXEL_DRAG_PROFILE_HEAD": head, "PIXEL_DRAG_PROFILE_OUTPUT": str(profile_path)}
     command = ["bun", "test", "--preload", "./test/support/dom.ts", "--preload", "./scripts/pixel-art-drag-profile/preload.ts",
                "./examples/pixel-art/native.test.ts", "--test-name-pattern", FILTER]
-    provenance = {"head": head, "base": BASE, "bun": bun, "node": node, "frozenHashes": hashes, "command": command}
-    (out / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    supervision = supervise(command, raw_path, env)
-    (out / "supervision.json").write_text(json.dumps(supervision, indent=2) + "\n")
+    provenance.update(stage="supervision", head=head, base=BASE, bun=bun, node=node, frozenHashes=hashes, command=command)
+    write("provenance.json", provenance)
+    supervise(command, raw_path, env, state=supervision)
+    write("supervision.json", supervision)
+    provenance["stage"] = "validation"
     decode_problem = None
     try:
         profile = json.loads(profile_path.read_text()) if profile_path.exists() else {}
@@ -123,7 +171,10 @@ def main():
         if not png.exists() or png.read_bytes()[:8] != b"\x89PNG\r\n\x1a\n":
             result["completeEvidence"] = False
             result["problems"].append("successful run missing native screenshot")
-    (out / "validation.json").write_text(json.dumps(result, indent=2) + "\n")
+    write("validation.json", result)
+    provenance["stage"] = "finished"
+    write("provenance.json", provenance)
+    write("error.json", {"stage": "finished", "failure": None})
     print(json.dumps(result))
     original = supervision["returncode"]
     return original if original and original > 0 else (0 if original == 0 and result["completeEvidence"] else 1)
