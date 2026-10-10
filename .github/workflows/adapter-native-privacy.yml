@@ -1,0 +1,271 @@
+name: Combined adapter native privacy qualification
+
+# Preparation does not launch a run. A separately reviewed opened PR releases
+# one serialized two-platform event; subsequent pushes never repeat it.
+on:
+  pull_request:
+    types: [opened]
+    paths: [.github/workflows/adapter-native-privacy.yml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: combined-adapter-native-privacy
+  cancel-in-progress: false
+
+jobs:
+  macos:
+    if: ${{ github.repository == 'julia-script/foldkit-native' }}
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      QUALIFICATION_HEAD: ${{ github.event.pull_request.head.sha }}
+      NAPI_RS_ENFORCE_VERSION_CHECK: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: julia-script/foldkit-native
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Seed early macOS evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/macos-privacy-evidence"
+          printf 'channel=macos-painted\nexpected_head=%s\n' "$QUALIFICATION_HEAD" > "$RUNNER_TEMP/macos-privacy-evidence/started.log"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+      - name: Install exact locked dependencies
+        run: |
+          set +e
+          npm ci > "$RUNNER_TEMP/macos-privacy-evidence/npm-ci.log" 2>&1
+          status=$?
+          cat "$RUNNER_TEMP/macos-privacy-evidence/npm-ci.log"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/macos-privacy-evidence/npm-ci.exit"
+          exit "$status"
+      - name: Qualify unchanged macOS painted fixture once
+        run: python3 scripts/qualification/adapter-native.py macos "$PWD" "$RUNNER_TEMP/macos-privacy-evidence"
+      - name: Preserve macOS result and evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: combined-macos-painted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/macos-privacy-evidence/
+          if-no-files-found: error
+          retention-days: 7
+  linux:
+    needs: macos
+    if: ${{ !cancelled() && github.repository == 'julia-script/foldkit-native' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      QUALIFICATION_HEAD: ${{ github.event.pull_request.head.sha }}
+      NAPI_RS_ENFORCE_VERSION_CHECK: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
+      # A real Wayland surface backed by Mesa software Vulkan, not a fake
+      # renderer. Physical GPU performance is outside this targeted gate.
+      WLR_RENDERER: pixman
+      WLR_RENDERER_ALLOW_SOFTWARE: '1'
+      LIBGL_ALWAYS_SOFTWARE: '1'
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
+      NO_COLOR: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: julia-script/foldkit-native
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Seed early Linux evidence
+        run: |
+          mkdir -p "$RUNNER_TEMP/linux-privacy-evidence"
+          printf 'channel=linux-retained-content\nexpected_head=%s\n' "$QUALIFICATION_HEAD" > "$RUNNER_TEMP/linux-privacy-evidence/started.log"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+      - name: Install Wayland and native runtime libraries
+        run: |
+          set +e
+          (
+            set -e
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y sway grim strace \
+              mesa-vulkan-drivers libvulkan1 libegl1 libgl1-mesa-dri \
+              libwayland-client0 libxkbcommon0 libxkbcommon-x11-0 \
+              libfontconfig1 fonts-dejavu-core
+          ) > "$RUNNER_TEMP/linux-privacy-evidence/system-install.log" 2>&1
+          status=$?
+          cat "$RUNNER_TEMP/linux-privacy-evidence/system-install.log"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/linux-privacy-evidence/system-install.exit"
+          exit "$status"
+      - name: Install immutable qualification head dependencies
+        run: |
+          set +e
+          npm ci > "$RUNNER_TEMP/linux-privacy-evidence/npm-ci.log" 2>&1
+          status=$?
+          cat "$RUNNER_TEMP/linux-privacy-evidence/npm-ci.log"
+          printf '%s\n' "$status" > "$RUNNER_TEMP/linux-privacy-evidence/npm-ci.exit"
+          exit "$status"
+      - name: Run dedicated native retained-content qualification once
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/linux-privacy-evidence"
+          export PRIVACY_EVIDENCE="$evidence"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/linux-privacy-runtime"
+          export XDG_DATA_HOME="$RUNNER_TEMP/linux-privacy-data"
+          export TMPDIR="$evidence/session"
+          mkdir -p "$evidence" "$TMPDIR" "$XDG_DATA_HOME"
+          printf 'preflight-start\nexpected_head=%s\ndeclared_icd=%s\n' \
+            "$QUALIFICATION_HEAD" "$VK_DRIVER_FILES" > "$evidence/preflight.log"
+          preflight_failure() {
+            local status="$1" line="$2" failed_command="$3"
+            trap - ERR
+            printf 'preflight-failure status=%s line=%s command=%s\n' \
+              "$status" "$line" "$failed_command" >&2 || true
+            printf 'preflight-failure status=%s line=%s command=%s\n' \
+              "$status" "$line" "$failed_command" >> "$evidence/preflight.log" || true
+            exit "$status"
+          }
+          trap 'preflight_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
+          # Diagnostics do not replace or relax any guard below.
+          {
+            printf 'actual_head\n'
+            git rev-parse HEAD || true
+            printf 'reviewed_source_objects\n'
+            for target in packages/foldkit-gpuix/src src \
+              packages/foldkit-gpuix/test/automation-secrets-native.test.ts \
+              packages/foldkit-gpuix/test/secret-stale-native-app.ts \
+              package-lock.json scripts/wayland-session.sh; do
+              printf '%s=' "$target"
+              git rev-parse "HEAD:$target" || true
+            done
+            printf 'runtime\n'
+            uname -sm || true
+            bun --version || true
+            node --version || true
+            printf 'installed_icd_manifest\n'
+            dpkg-query -L mesa-vulkan-drivers || true
+          } >> "$evidence/preflight.log" 2>&1
+          install -d -m 700 "$XDG_RUNTIME_DIR"
+          test "$(git rev-parse HEAD)" = "$QUALIFICATION_HEAD"
+          # Reviewed current-main production, original macOS fixture and supported
+          # session must match frozen current-main qualification candidate.
+          test "$(git rev-parse HEAD:packages/foldkit-gpuix/src)" = a9416e350352855beb99779eb2dadaa141f3614e
+          test "$(git rev-parse HEAD:src)" = a31463f8c1827c0bcc480291176d6221a4c8caf4
+          test "$(git rev-parse HEAD:packages/foldkit-gpuix/test/automation-secrets-native.test.ts)" = a99dac70cf3f805aed4e1efa4ef709ac91a6bba3
+          test "$(git rev-parse HEAD:packages/foldkit-gpuix/test/secret-stale-native-app.ts)" = 245893914657980725b44e41eb8f9609f2413246
+          test "$(git rev-parse HEAD:package-lock.json)" = 456982bbd587fbaa4087894eb56640129c55b9a4
+          test "$(git rev-parse HEAD:scripts/wayland-session.sh)" = 7927ade9fa7d1ae73cacb7e047a41117e2501ba9
+          test "$(uname -sm)" = 'Linux x86_64'
+          test "$(bun --version)" = '1.3.9'
+          test "$(node --version)" = 'v22.22.3'
+          test -f "$VK_DRIVER_FILES"
+          {
+            git rev-parse HEAD
+            uname -sm
+            node --version
+            bun --version
+            ldd --version
+            sway --version
+            sha256sum package-lock.json scripts/wayland-session.sh \
+              packages/foldkit-gpuix/test/automation-secrets-native.test.ts \
+              packages/foldkit-gpuix/test/secret-stale-native-app.ts \
+              packages/foldkit-gpuix/test/automation-secrets-linux.test.ts \
+              packages/foldkit-gpuix/test/secret-retained-linux-app.ts
+          } > "$evidence/provenance.log" 2>&1
+          node --input-type=module - <<'JS' > "$evidence/dependencies.log"
+          import { readFileSync } from 'node:fs'
+          for (const [name, expected] of [['@gpuix/native', '0.10.0'], ['@gpuix/native-linux-x64-gnu', '0.10.0'], ['foldkit', '0.165.0'], ['effect', '4.0.0']]) {
+            const version = JSON.parse(readFileSync(`node_modules/${name}/package.json`, 'utf8')).version
+            console.log(name, version)
+            if (version !== expected) throw new Error(`Unexpected ${name} version`)
+          }
+          JS
+          binding=node_modules/@gpuix/native-linux-x64-gnu/gpuix-native.linux-x64-gnu.node
+          ldd "$binding" > "$evidence/native-libraries.log" 2>&1
+          if grep -q 'not found' "$evidence/native-libraries.log"; then
+            cat "$evidence/native-libraries.log"
+            exit 1
+          fi
+          dpkg-query -W sway grim mesa-vulkan-drivers libvulkan1 libegl1 libxkbcommon0 > "$evidence/system-packages.log"
+          python3 scripts/qualification/adapter-native.py linux-before "$PWD" "$evidence" > "$evidence/identity-before.log" 2>&1
+          trap - ERR
+          cat > "$evidence/command.sh" <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          test "$FKN_LINUX_WINDOWS" = 1
+          test -n "$WAYLAND_DISPLAY"
+          test -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+          test -z "${DISPLAY:-}"
+          test -S "$FKN_SWAYSOCK"
+          bun --eval 'import { WINDOWS } from "./test/support/windows.ts"; if (process.platform !== "linux" || !WINDOWS) throw new Error("Native window guard is false"); console.log("Linux native window guard: true")' > "$PRIVACY_EVIDENCE/guard.log" 2>&1
+          swaymsg -s "$FKN_SWAYSOCK" -t get_outputs -r > "$PRIVACY_EVIDENCE/outputs.json"
+          # Retained-content qualification only; never painted editor timing.
+          export LINUX_PRIVACY_EVIDENCE="$PRIVACY_EVIDENCE"
+          bun test packages/foldkit-gpuix/test/automation-secrets-linux.test.ts \
+            --reporter=junit --reporter-outfile="$PRIVACY_EVIDENCE/junit.xml" \
+            > "$PRIVACY_EVIDENCE/test.stdout" 2> "$PRIVACY_EVIDENCE/test.stderr"
+          SH
+          # Child stdout/stderr and incremental raw observations are saved by
+          # the dedicated parent fixture. Trace only owned process lifetimes
+          # for cleanup evidence, without tracing environment or other services.
+          set +e
+          KEEP_WORK=1 timeout --signal=TERM --kill-after=10s 420s \
+            strace -ff -e trace=clone,clone3,fork,vfork,exit_group \
+            -o "$evidence/trace" bash scripts/wayland-session.sh \
+            --size 320x180 --shots "$evidence/shots" -- bash "$evidence/command.sh" \
+            > "$evidence/session.stdout" 2> "$evidence/session.stderr"
+          status=$?
+          set -e
+          printf '%s\n' "$status" > "$evidence/session.exit"
+          cat "$evidence/session.stdout" "$evidence/session.stderr"
+          for file in "$evidence/test.stdout" "$evidence/test.stderr"; do
+            if [[ -f "$file" ]]; then cat "$file"; fi
+          done
+          # timeout owns a process group containing the test, its native child
+          # and sway. The supported session also stops its own sway PID.
+          cleanup_failed=0
+          shopt -s nullglob
+          cleanup_deadline=$((SECONDS + 5))
+          for trace in "$evidence"/trace.*; do
+            pid="${trace##*.}"
+            while kill -0 "$pid" 2>/dev/null && (( SECONDS < cleanup_deadline )); do
+              sleep 0.1
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              printf 'owned traced PID still present: %s\n' "$pid" >> "$evidence/cleanup.log"
+              cleanup_failed=1
+            else
+              printf 'owned traced PID exited: %s\n' "$pid" >> "$evidence/cleanup.log"
+            fi
+          done
+          git status --porcelain > "$evidence/target-status.log"
+          identity_failed=0
+          python3 scripts/qualification/adapter-native.py linux-after "$PWD" "$evidence" > "$evidence/identity-after.log" 2>&1 || identity_failed=$?
+          # Preserve the original failing exit before examining pass evidence.
+          if [[ "$status" != 0 ]]; then exit "$status"; fi
+          test "$cleanup_failed" = 0
+          test "$identity_failed" = 0
+          test ! -s "$evidence/target-status.log"
+          python3 scripts/qualification/adapter-native.py validate-linux "$PWD" "$evidence"
+      - name: Preserve qualification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: combined-linux-retained-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/linux-privacy-evidence/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Remove owned runtime directories
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/linux-privacy-runtime" "$RUNNER_TEMP/linux-privacy-data"
