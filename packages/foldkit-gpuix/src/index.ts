@@ -15,6 +15,7 @@
 // text input are GPUI's own.
 
 import type { EventPayload, WindowOptions } from '@gpuix/native'
+import { InProcessBackend, createSseDecoder, handleAutomationRequest, liveRendererAsTest } from '@gpuix/native/automation'
 import { type NativeRenderer, createRendererState } from '@gpuix/native/host'
 
 import { redactingRenderer, secretValues } from './automation.ts'
@@ -382,14 +383,20 @@ export const mountGpuix = (options: NativeOptions = {}) => {
   // gpuix's own GpuixRenderer, not createNativeRenderer's, which would serve
   // it whenever stdin isn't a terminal.
   // It serves the renderer less a person's secrets (automation.ts).
-  let automationListeners: ReturnType<typeof process.stdin.listeners> = []
+  let automationListener: ((chunk: string) => void) | undefined
   if (automationRequested(automation)) {
     const fields = () => attached?.document.querySelectorAll('input, textarea') ?? []
-    // gpuix 0.10 returns no disposer. Capture only the listeners its
-    // synchronous registration adds, before any other app or host work.
-    const before = new Set(process.stdin.listeners('data'))
-    gpuix.runtime.enableAutomation(redactingRenderer(renderer, () => secretValues(fields() as never)) as never)
-    automationListeners = process.stdin.listeners('data').filter(listener => !before.has(listener))
+    // Use gpuix's protocol/backend, but own the stdin callback explicitly:
+    // its enableAutomation returns no disposer, and a listener snapshot
+    // would also claim host registrations triggered by `newListener`.
+    const backend = new InProcessBackend(liveRendererAsTest(redactingRenderer(renderer, () => secretValues(fields() as never)) as never))
+    const decoder = createSseDecoder(message => {
+      if (!('method' in message)) return
+      void handleAutomationRequest(message, backend).then(reply => { process.stdout.write(reply) })
+    })
+    automationListener = chunk => decoder.feed(chunk)
+    process.stdin.setEncoding('utf8')
+    process.stdin.on('data', automationListener)
   }
 
   const { width, height } = windowOptions
@@ -433,15 +440,26 @@ export const mountGpuix = (options: NativeOptions = {}) => {
       try {
         release()
       } catch (error) {
-        report('close', error, { reason: windowGone ? 'window' : 'close', stage: 'teardown' })
+        try {
+          report('close', error, { reason: windowGone ? 'window' : 'close', stage: 'teardown' })
+        } catch {
+          // A host's onError and its console fallback may both throw.
+          // Reporting must not abandon the remaining teardown steps.
+        }
       }
     }
-    attempt(() => loop.stop())
-    attempt(() => app.detach({ windowGone }))
-    // Release only this app's automation listeners, even if detach failed.
-    for (const listener of automationListeners) attempt(() => { process.stdin.off('data', listener as never) })
-    if (automationListeners.length > 0 && process.stdin.listenerCount('data') === 0) attempt(() => process.stdin.pause())
-    resolveClosed()
+    try {
+      attempt(() => loop.stop())
+      attempt(() => app.detach({ windowGone }))
+      // Release only this app's automation listener, even if detach failed.
+      if (automationListener !== undefined) {
+        const listener = automationListener
+        attempt(() => { process.stdin.off('data', listener) })
+        attempt(() => { if (process.stdin.listenerCount('data') === 0) process.stdin.pause() })
+      }
+    } finally {
+      resolveClosed()
+    }
     if (exitOnClose) process.exit(0)
   }
   const close = (options: { force?: boolean } = {}): Promise<boolean> => {

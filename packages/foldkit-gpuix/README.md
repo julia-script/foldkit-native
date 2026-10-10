@@ -105,6 +105,8 @@ are reported through `onError` with phase `close` and
 still resolves `true`, and `app.closed` settles after the cleanup attempts;
 repeated or forced close does not run them or report their errors again.
 Calling `detach()` directly instead throws after attempting all its cleanup.
+Failures in `onError` and its console fallback cannot interrupt teardown or
+prevent `app.closed` from settling.
 
 - **Close handlers**: `onClose(handler)` (or the `onClose` option). They run
   before anything is taken down, so they can still read the model and save,

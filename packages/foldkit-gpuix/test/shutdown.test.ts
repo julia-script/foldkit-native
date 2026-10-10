@@ -1,6 +1,7 @@
 // Shutdown ownership and exception safety through the production app APIs.
 // Every renderer here is a fake: no native window or Metal work.
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, expect, spyOn, test } from 'bun:test'
+import { connectStdio } from '@gpuix/native/automation'
 import { createRendererState } from '@gpuix/native/host'
 
 import { attachGpuix, type ErrorReport, type NativeOptions, mountGpuix } from '../src/index.ts'
@@ -79,6 +80,86 @@ test('shutdown does not claim a host listener installed by renderer initializati
   await app.close()
   expect(process.stdin.listeners('data')).toContain(listener)
 })
+
+test('shutdown preserves a host listener registered by newListener during automation setup', async () => {
+  let inserted = false, delivered = 0
+  const host = () => { delivered++ }
+  const observer = (event: string) => {
+    if (event === 'data' && !inserted) {
+      inserted = true
+      listen(host)
+    }
+  }
+  process.stdin.on('newListener', observer)
+  try {
+    const { app } = open({ automation: true })
+    process.stdin.off('newListener', observer)
+    expect(inserted).toBe(true)
+    expect(process.stdin.listeners('data')).toContain(host)
+    await app.close()
+    await app.closed
+    process.stdin.emit('data', Buffer.from(''))
+    expect(process.stdin.listeners('data')).toContain(host)
+    expect(delivered).toBe(1)
+  } finally { process.stdin.off('newListener', observer) }
+})
+
+test('shutdown keeps the gpuix automation protocol working with an explicitly owned listener', async () => {
+  const original = process.stdin.listeners('data')
+  const window = createFakeWindow()
+  const { app } = open({ automation: true, createRenderer: callback => ({
+    ...window.createRenderer(callback),
+    getPaintedText: () => ['Public label'],
+  }) })
+  const feed: Array<(chunk: string) => void> = []
+  const output = spyOn(process.stdout, 'write').mockImplementation(chunk => {
+    const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk)
+    for (const listener of feed) listener(text)
+    return true
+  })
+  try {
+    const client = await connectStdio({ write: chunk => { process.stdin.emit('data', chunk) }, feed: listener => { feed.push(listener) } })
+    try {
+      expect(await client.call('getPaintedText', {})).toEqual({ text: ['Public label'] })
+    } finally { await client.close() }
+    await app.close()
+    expect(process.stdin.listeners('data')).toEqual(original)
+  } finally { output.mockRestore() }
+})
+
+for (const loggingThrows of [false, true]) {
+  test(`shutdown completes even when onError throws, loggingThrows=${loggingThrows}`, async () => {
+    const original = process.stdin.listeners('data')
+    const before = globalThis.document
+    const reports: Array<ErrorReport> = []
+    const { app, window } = open({ automation: true, onError: report => {
+      reports.push(report)
+      throw new Error('reporter failed')
+    } })
+    const owned = process.stdin.listeners('data').filter(listener => !original.includes(listener))
+    const problem = new Error('owned failure')
+    const released: Array<string> = []
+    app.own({ dispose: () => { released.push('older') } })
+    app.own({ dispose: () => { released.push('newer'); throw problem } })
+    const quiet = spyOn(console, 'error').mockImplementation(() => {
+      if (loggingThrows) throw new Error('logger failed')
+    })
+    try {
+      expect(await app.close()).toBe(true)
+      await Promise.race([app.closed, frames(3).then(() => { throw new Error('closed did not settle') })])
+      expect(released).toEqual(['newer', 'older'])
+      expect(window.fake.gpui.retainedCount()).toBe(0)
+      expect(createRendererState(app.renderer).current()).toBeUndefined()
+      expect(globalThis.document).toBe(before)
+      for (const listener of owned) expect(process.stdin.listeners('data')).not.toContain(listener)
+      expect(reports).toEqual([{ phase: 'close', error: problem, context: { reason: 'close', stage: 'teardown' } }])
+      expect(quiet).toHaveBeenCalledTimes(1)
+      expect(await app.close({ force: true })).toBe(true)
+      expect(released).toEqual(['newer', 'older'])
+      expect(quiet).toHaveBeenCalledTimes(1)
+    } finally { quiet.mockRestore() }
+  })
+}
 
 for (const throws of [false, true]) {
   test(`shutdown attempts every owned disposer once, restores globals and settles, throws=${throws}`, async () => {
