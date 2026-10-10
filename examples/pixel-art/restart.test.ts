@@ -86,7 +86,7 @@ describe.skipIf(!WINDOWS)('Pixel Art, native window, two launches', () => {
       expect(before.grid).toEqual(createEmptyGrid(16))
 
       // Resize the blank canvas and make no further painting/palette changes.
-      await first.app.getByText('8').click()
+      await first.app.getByTestId('grid-size-picker-option-0').getByText('8').click()
       for (let i = 0; i < 20 && savedCanvas().gridSize !== 8; i++) await settle(100)
       const resized = savedCanvas()
       expect(resized.gridSize).toBe(8)
