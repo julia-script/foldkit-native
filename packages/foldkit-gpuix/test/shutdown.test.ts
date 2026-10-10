@@ -109,8 +109,12 @@ test('shutdown keeps the gpuix automation protocol working with an explicitly ow
   const window = createFakeWindow()
   const { app } = open({ automation: true, createRenderer: callback => ({
     ...window.createRenderer(callback),
-    getPaintedText: () => ['Public label'],
+    getPaintedText: () => ['Public label', '596274'],
   }) })
+  const secret = app.document.createElement('input')
+  secret.setAttribute('autocomplete', 'one-time-code')
+  secret.value = '596274'
+  app.document.body.appendChild(secret)
   const feed: Array<(chunk: string) => void> = []
   const output = spyOn(process.stdout, 'write').mockImplementation(chunk => {
     const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk)
@@ -118,13 +122,75 @@ test('shutdown keeps the gpuix automation protocol working with an explicitly ow
     return true
   })
   try {
-    const client = await connectStdio({ write: chunk => { process.stdin.emit('data', chunk) }, feed: listener => { feed.push(listener) } })
+    const client = await connectStdio({ write: chunk => {
+      // Split even the SSE prefix and JSON; the decoder must retain fragments.
+      process.stdin.emit('data', chunk.slice(0, 3))
+      process.stdin.emit('data', chunk.slice(3, 11))
+      process.stdin.emit('data', chunk.slice(11))
+    }, feed: listener => { feed.push(listener) } })
     try {
-      expect(await client.call('getPaintedText', {})).toEqual({ text: ['Public label'] })
+      expect(await client.call('getPaintedText', {})).toEqual({ text: ['Public label', '••••••'] })
     } finally { await client.close() }
+    let delivered = 0
+    const host = listen(() => { delivered++ })
     await app.close()
-    expect(process.stdin.listeners('data')).toEqual(original)
+    expect(process.stdin.listeners('data')).toEqual([...original, host])
+    const replies = output.mock.calls.length
+    process.stdin.emit('data', 'data: {"id":99,"method":"getPaintedText","params":{}}\n\n')
+    await frames(1)
+    expect(delivered).toBe(1)
+    expect(output.mock.calls.length).toBe(replies)
   } finally { output.mockRestore() }
+})
+
+test('shutdown automation helpers leave native loading lazy when the native module is unavailable', async () => {
+  // Node's synchronous loader hooks cover createRequire too. Verify that
+  // interception before mounting: this child cannot open a native window.
+  const source = new URL('../src/index.ts', import.meta.url).pathname
+  const root = new URL('../../../', import.meta.url)
+  const child = Bun.spawn(['node', '--input-type=module', '-'], { cwd: root.pathname, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe' })
+  child.stdin.write(`
+    import assert from 'node:assert/strict'
+    import { createRequire, registerHooks } from 'node:module'
+    import { readFileSync } from 'node:fs'
+    import { fileURLToPath } from 'node:url'
+    import ts from ${JSON.stringify(import.meta.resolve('typescript'))}
+    let loads = 0
+    const unavailable = new Error('native module unavailable')
+    registerHooks({
+      resolve(specifier, context, next) {
+        if (specifier === '@gpuix/native' || specifier === '@gpuix/native/runtime') { loads++; throw unavailable }
+        // Match the project's tsconfig self-reference alias.
+        if (specifier.startsWith('foldkit-native/')) return {
+          url: new URL('src/' + specifier.slice('foldkit-native/'.length) + '.ts', ${JSON.stringify(root.href)}).href,
+          shortCircuit: true,
+        }
+        return next(specifier, context)
+      },
+      load(url, context, next) {
+        if (url.endsWith('.ts')) return { format: 'module', shortCircuit: true,
+          source: ts.transpileModule(readFileSync(fileURLToPath(url), 'utf8'), {
+            compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2023 },
+          }).outputText,
+        }
+        return next(url, context)
+      },
+    })
+    const adapter = await import(${JSON.stringify(source)})
+    assert.equal(typeof adapter.mountGpuix, 'function')
+    assert.equal(loads, 0, 'adapter import must not load native')
+    const require = createRequire(import.meta.url)
+    assert.equal(Object.keys(require.cache).filter(path => path.endsWith('.node')).length, 0)
+    assert.throws(() => require('@gpuix/native'), error => error === unavailable)
+    assert.throws(() => adapter.mountGpuix({ exitOnClose: false, automation: false }), adapter.NativeStartError)
+    assert.equal(loads, 2)
+    console.log('lazy native loading verified')
+  `)
+  child.stdin.end()
+  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+  expect(stderr).toBe('')
+  expect(code).toBe(0)
+  expect(stdout).toContain('lazy native loading verified')
 })
 
 for (const loggingThrows of [false, true]) {
