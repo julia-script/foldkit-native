@@ -1,9 +1,10 @@
 """Separate original/control results. A control pass NEVER accepts a failed original."""
+import sys
+sys.dont_write_bytecode = True  # Before importing the checkout's supervisor.
 import json
 import math
 from pathlib import Path
 import signal
-import sys
 import run as original
 
 CSS = ' body, .app { background-color: #ffffff; color: #000000; }'

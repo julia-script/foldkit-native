@@ -1,13 +1,15 @@
 """One immutable README native gate. No aggregate tests or target file writes."""
+import sys
+sys.dont_write_bytecode = True
+import os
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'  # Owned Python subprocesses inherit the same policy.
 import hashlib
 import json
-import os
 from pathlib import Path
 import platform
 import re
 import signal
 import subprocess
-import sys
 import time
 
 HEAD = 'c4e4ced134f327c143d50dea3c03774fa28738d0'
@@ -122,10 +124,18 @@ def source(root):
     return evidence, snippet.decode()
 
 
-def driver_source():
+def driver_source(out=None, phase='before'):
     root = HERE.parent.parent
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
-    clean = subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True)
+    clean = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=all'], cwd=root, text=True)
+    if out is not None:
+        try:
+            save(out, f'driver-state-{phase}', {'head': head, 'expectedGITHUB_SHA': os.environ.get('GITHUB_SHA'),
+                 'clean': clean, 'python': sys.version, 'executable': sys.executable,
+                 'bytecodeDisabled': sys.dont_write_bytecode, 'cachePrefix': sys.pycache_prefix,
+                 'subprocessBytecodeDisabled': os.environ.get('PYTHONDONTWRITEBYTECODE')})
+        except OSError:
+            pass  # An evidence write failure must not replace the original guard rejection.
     require(not clean and head == os.environ.get('GITHUB_SHA'), 'runner is not the clean reviewed event head')
     files = [root / '.github/workflows/hosted-readme-qualification.yml', root / '.github/workflows/hosted-readme-contrast-qualification.yml', *HERE.glob('*.py'), *HERE.glob('*.ts'), *HERE.glob('*.swift')]
     return {'head': head, 'clean': clean, 'files': {str(path.relative_to(root)): sha(path.read_bytes()) for path in files}}
@@ -187,7 +197,7 @@ def run(root, out, case='original'):
         require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'requires real macOS Apple silicon host')
         require('FOLDKIT_NATIVE_NO_WINDOW' not in os.environ, 'headless mode forbidden')
         require('NAPI_RS_NATIVE_LIBRARY_PATH' not in os.environ, 'alternate native binding forbidden')
-        driver = driver_source()
+        driver = driver_source(out, 'before')
         save(out, 'driver-before', driver)
         before, snippet = source(root)
         save(out, 'source-before', before)
@@ -236,7 +246,7 @@ def run(root, out, case='original'):
         try:
             after, _ = source(root)
             save(out, 'source-after', after)
-            after_driver = driver_source()
+            after_driver = driver_source(out, 'after')
             save(out, 'driver-after', after_driver)
             require(after_driver == driver, 'qualification driver changed during execution')
         except BaseException as error:
