@@ -18,11 +18,12 @@ import time
 HEADS = {
     "70": "e41853d099e96375912d43cb209bad4388ac5654",
     "71": "bc79903867ec1f6885a27e1f88ac4e956a30e7a5",
-    "72": "abb9539bd959af72d1289dd2005d8e41100320a8",
+    "72": "fbdc40896b018cba6b81d1272c6aa3d7917296ae",
     "81": "7f448bf5d8590685b9c946e0c8f079f5c795c5e3",
 }
 LOCK = "010dbbba16a62bc9d29b5f5a45ff48d3ae534e2ea9c011820978101562bdb4be"
 HERE = Path(__file__).resolve().parent
+RESTART_SHA256 = "4f1652b8fff0228a3f62bf8d5314ee116e0fe0081d35942c625677a13bdb4ea2"
 
 
 def require(condition, reason):
@@ -50,10 +51,15 @@ def signal_group(pgid, value):
 def command(argv, cwd, env, out, name, timeout, grace=3):
     log = out / f"{name}.log"
     record = {"argv": list(map(str, argv)), "cwd": str(cwd), "started": time.time(), "timeoutSeconds": timeout}
+    (out / f"{name}.json").write_text(json.dumps({**record, "status": "starting"}, indent=2))
     with log.open("wb") as stream:
-        child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
-                                 stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
-        seen = {}
+        try:
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                     stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
+        except Exception as error:
+            (out / f"{name}.json").write_text(json.dumps({**record, "status": "spawn-failed", "reason": repr(error), "finished": time.time()}, indent=2))
+            raise
+        seen = {child.pid: {"pid": child.pid, "args": " ".join(map(str, argv))}}
         timed_out = False
         interrupted = None
         try:
@@ -106,6 +112,32 @@ def test_passed(log, name):
 
 def nonempty(path):
     require(path.is_file() and path.stat().st_size > 0, f"missing output: {path}")
+
+
+def restart_source(target, out, stage):
+    digest = hashlib.sha256((target / "examples/pixel-art/restart.test.ts").read_bytes()).hexdigest()
+    (out / f"restart-source-{stage}.json").write_text(json.dumps({"head": HEADS["72"], "path": "examples/pixel-art/restart.test.ts", "sha256": digest}, indent=2))
+    require(digest == RESTART_SHA256, "tracked restart fixture differs from source-reviewed locator repair")
+
+
+def restart_output(log, out):
+    require(re.search(r"\b17 expect\(\) calls\b", log), "original restart assertions did not all execute")
+    match = re.search(r"Pixel Art restart: #262427 at the first start, (#[0-9a-fA-F]{6}) picked, (#[0-9a-fA-F]{6}) at the second start", log)
+    require(match is not None and match[1] == match[2] and match[1] != "#262427", "missing positive second-launch colour restoration")
+    screenshots = []
+    for name in ("pixel-art-restart-1-picked.png", "pixel-art-restart-2-relaunched.png"):
+        path = out / name
+        nonempty(path)
+        raw = path.read_bytes()
+        require(raw[:8] == b"\x89PNG\r\n\x1a\n" and len(raw) > 100, "missing native restart PNG")
+        width, height = int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+        require(width > 0 and height > 0, "empty native restart PNG dimensions")
+        screenshots.append({"name": name, "bytes": len(raw), "width": width, "height": height, "sha256": hashlib.sha256(raw).hexdigest()})
+    command_record = json.loads((out / "tracked-restart.json").read_text())
+    launches = [item for item in command_record["ownedProcesses"] if "examples/open.ts pixel-art" in item["args"]]
+    require(len({item["pid"] for item in launches}) == 2, "two actual owned native launches not observed")
+    require(command_record["status"] == "passed" and command_record["exit"] == 0 and not command_record["leaked"] and not command_record["survivors"], "tracked restart command or owned cleanup failed")
+    (out / "restart-acceptance.json").write_text(json.dumps({"head": HEADS["72"], "fixtureSha256": RESTART_SHA256, "expects": 17, "picked": match[1], "restored": match[2], "launches": launches, "screenshots": screenshots}, indent=2))
 
 
 def cart_inputs(out):
@@ -181,7 +213,7 @@ def theme_states(raw, report=None):
 
 
 def qualify(case, target, out):
-    out.mkdir(parents=True, exist_ok=False)
+    out.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     require(platform.system() == "Darwin" and platform.machine() == "arm64", "requires supported macOS arm64 hosted runner")
     require("FOLDKIT_NATIVE_NO_WINDOW" not in env, "NO_WINDOW would skip native tests")
@@ -196,6 +228,10 @@ def qualify(case, target, out):
     require(head == HEADS[case], "target HEAD differs from reviewed immutable SHA")
     require(not run(["git", "status", "--porcelain", "--untracked-files=no"], "status-before", 10).strip(), "target has tracked changes")
     require(hashlib.sha256((target / "package-lock.json").read_bytes()).hexdigest() == LOCK, "unexpected lockfile")
+    restart_source(target, out, "before")
+    driver = run(["git", "-C", str(HERE.parent.parent), "rev-parse", "HEAD"], "driver-head", 10).strip()
+    require(driver == env.get("GITHUB_SHA"), "driver differs from the reviewed push head")
+    require(not run(["git", "-C", str(HERE.parent.parent), "status", "--porcelain"], "driver-status", 10).strip(), "driver has source changes")
     provenance = {"head": head, "case": case, "driverHead": os.environ.get("GITHUB_SHA"), "platform": platform.platform(), "machine": platform.machine(), "lockSha256": LOCK, "toolPaths": {tool: shutil.which(tool) for tool in ("node", "bun", "npm")}}
     for tool in ("node", "bun", "npm"):
         provenance[tool] = run([tool, "--version"], f"{tool}-version", 10).strip()
@@ -247,6 +283,7 @@ def qualify(case, target, out):
         require("Pixel Art restart: #262427 at the first start," in log, "missing actual restart fixture output")
         for name in ("pixel-art-restart-1-picked.png", "pixel-art-restart-2-relaunched.png"):
             nonempty(out / name)
+        restart_output(log, out)
     else:
         log = run(["bun", "test", "--preload", str(HERE / "capture-privacy.mjs"), "packages/foldkit-gpuix/test/automation-secrets-native.test.ts"], "tracked-privacy", 115)
         test_passed(log, "native privacy: stale clear/replacement/removal and acknowledged public reuse")
@@ -256,14 +293,16 @@ def main():
         raise KeyboardInterrupt("qualification interrupted")
     signal.signal(signal.SIGTERM, interrupted)
     case, root, destination = sys.argv[1:]
-    require(case in HEADS, "unknown qualification target")
+    require(case == "72", "this dedicated runner only permits PR72")
     target, out = Path(root).resolve(), Path(destination).resolve()
     require(not out.is_relative_to(target), "evidence must be outside target checkout")
     result = {"case": case, "targetHead": HEADS[case], "started": time.time(), "status": "failed"}
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "result.json").write_text(json.dumps(result, indent=2))
     try:
         qualify(case, target, out)
         result["status"] = "passed"
-    except Exception as error:
+    except BaseException as error:
         result["reason"] = str(error)
         print(f"PR{case}: FAILED: {error}", file=sys.stderr)
     finally:
@@ -273,11 +312,14 @@ def main():
             head = command(["git", "rev-parse", "HEAD"], target, dict(os.environ), out, "head-after", 10).strip()
             status = command(["git", "status", "--porcelain", "--untracked-files=no"], target, dict(os.environ), out, "status-after", 10).strip()
             require(head == HEADS[case] and not status, "target revision/source changed")
+            restart_source(target, out, "after")
         except Exception as error:
             result["status"] = "failed"
             result["sourceCheckFailure"] = str(error)
         result["finished"] = time.time()
         (out / "result.json").write_text(json.dumps(result, indent=2))
+        files = {str(path.relative_to(out)): hashlib.sha256(path.read_bytes()).hexdigest() for path in out.rglob("*") if path.is_file() and path.name != "manifest.json"}
+        (out / "manifest.json").write_text(json.dumps(files, indent=2))
     return 0 if result["status"] == "passed" else 1
 
 

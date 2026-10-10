@@ -1,0 +1,82 @@
+name: Hosted Pixel Art restart qualification
+
+# Only a separately released reviewed push launches this one target.
+on:
+  push:
+    branches: [julia/hosted-pixel-restart-qualification]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-pixel-restart-qualification
+  cancel-in-progress: false
+
+jobs:
+  pr72:
+    if: ${{ github.repository == 'julia-script/foldkit-native' && github.ref == 'refs/heads/julia/hosted-pixel-restart-qualification' }}
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      EVIDENCE_NAME: pr72-fbdc40896b018cba6b81d1272c6aa3d7917296ae
+    steps:
+      - name: Seed early failure evidence before checkout or setup
+        run: |
+          export EVIDENCE="$RUNNER_TEMP/$EVIDENCE_NAME"
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          out = Path(os.environ['EVIDENCE'])
+          (out / 'workflow.json').write_text(json.dumps({
+              'driver': os.environ['GITHUB_SHA'], 'target': 'fbdc40896b018cba6b81d1272c6aa3d7917296ae',
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'host': platform.platform(), 'machine': platform.machine(), 'status': 'not-run'
+          }, indent=2))
+          PY
+      - name: Checkout reviewed dedicated runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          path: qualification
+          persist-credentials: false
+      - name: Checkout immutable repaired PR72
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: fbdc40896b018cba6b81d1272c6aa3d7917296ae
+          path: target
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+      - name: Run unchanged tracked two-launch restart fixture
+        run: python3 qualification/scripts/qualification/run.py 72 "$GITHUB_WORKSPACE/target" "$RUNNER_TEMP/$EVIDENCE_NAME"
+      - name: Preserve workflow outcome and startup failures
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          export EVIDENCE="$RUNNER_TEMP/$EVIDENCE_NAME"
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out = Path(os.environ['EVIDENCE'])
+          (out / 'workflow-outcome.json').write_text(json.dumps({
+              'jobStatus': os.environ['JOB_STATUS'], 'driver': os.environ['GITHUB_SHA'],
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT']
+          }, indent=2))
+          if not (out / 'result.json').exists():
+              (out / 'result.json').write_text(json.dumps({'status': 'failed', 'phase': 'before-supervisor', 'reason': 'checkout/setup did not reach the tracked fixture'}))
+          PY
+      - name: Preserve unique raw results, both PNGs and owned cleanup records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-pr72-fbdc40896b018cba6b81d1272c6aa3d7917296ae-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr72-fbdc40896b018cba6b81d1272c6aa3d7917296ae/
+          if-no-files-found: error
+          retention-days: 7

@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import run
-from run import cart_inputs, command, privacy_output, test_passed, theme_states
+from run import cart_inputs, command, privacy_output, restart_output, restart_source, test_passed, theme_states
 
 
 class Controls(unittest.TestCase):
@@ -58,8 +58,12 @@ class Controls(unittest.TestCase):
         import signal
         previous = signal.getsignal(signal.SIGTERM)
         destination = self.out / "evidence"
+        def failed_startup(*_args):
+            initial = json.loads((destination / "result.json").read_text())
+            self.assertEqual(initial["status"], "failed")
+            raise RuntimeError("scenario failed")
         try:
-            with patch.object(sys, "argv", ["run.py", "70", str(self.out / "target"), str(destination)]), patch.object(run, "qualify", side_effect=RuntimeError("scenario failed")), patch.object(run, "command", side_effect=[run.HEADS["70"], ""]) as probe:
+            with patch.object(sys, "argv", ["run.py", "72", str(self.out / "target"), str(destination)]), patch.object(run, "qualify", side_effect=failed_startup), patch.object(run, "command", side_effect=[run.HEADS["72"], ""]) as probe:
                 self.assertEqual(run.main(), 1)
                 self.assertEqual(probe.call_count, 2)
             result = json.loads((destination / "result.json").read_text())
@@ -67,6 +71,63 @@ class Controls(unittest.TestCase):
             self.assertEqual(result["reason"], "scenario failed")
         finally:
             signal.signal(signal.SIGTERM, previous)
+
+    def test_other_targets_cannot_launch_and_startup_failures_leave_records(self):
+        import signal
+        previous = signal.getsignal(signal.SIGTERM)
+        try:
+            for case in ("70", "71", "81"):
+                with patch.object(sys, "argv", ["run.py", case, str(self.out / "target"), str(self.out / "evidence")]), patch.object(run, "qualify") as launch:
+                    with self.assertRaisesRegex(RuntimeError, "only permits PR72"):
+                        run.main()
+                    launch.assert_not_called()
+            with self.assertRaises(FileNotFoundError):
+                command(["/not/a/real/executable"], self.out, {}, self.out, "spawn", 1)
+            record = json.loads((self.out / "spawn.json").read_text())
+            self.assertEqual(record["status"], "spawn-failed")
+            self.assertNotIn("exit", record)
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
+    def test_restart_requires_assertions_restoration_two_launches_and_both_pngs(self):
+        import struct
+        log = "17 expect() calls\nPixel Art restart: #262427 at the first start, #eeeeee picked, #eeeeee at the second start"
+        record = {"status": "passed", "exit": 0, "leaked": [], "survivors": [], "ownedProcesses": [{"pid": pid, "args": "bun examples/open.ts pixel-art"} for pid in (1, 2)]}
+        path = self.out / "tracked-restart.json"
+        def write():
+            path.write_text(json.dumps(record))
+        write()
+        for name in ("pixel-art-restart-1-picked.png", "pixel-art-restart-2-relaunched.png"):
+            # Header-only mock, never claimed as a native screenshot.
+            (self.out / name).write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 8 + struct.pack(">II", 760, 653) + b"\0" * 120)
+        restart_output(log, self.out)
+        for bad in (log.replace("17 expect", "6 expect"), log.replace("#eeeeee at the second", "#abcdef at the second"), log.replace("#eeeeee", "#262427"), ""):
+            with self.assertRaises(RuntimeError):
+                restart_output(bad, self.out)
+        record["ownedProcesses"].pop()
+        write()
+        with self.assertRaisesRegex(RuntimeError, "two actual"):
+            restart_output(log, self.out)
+        record["ownedProcesses"].append({"pid": 2, "args": "bun examples/open.ts pixel-art"})
+        record["survivors"] = [{"pid": 2}]
+        write()
+        with self.assertRaisesRegex(RuntimeError, "owned cleanup"):
+            restart_output(log, self.out)
+        record["survivors"] = []
+        write()
+        (self.out / "pixel-art-restart-2-relaunched.png").unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing output"):
+            restart_output(log, self.out)
+
+    def test_fixture_hash_drift_fails_closed_with_original_failure_artifacts(self):
+        target = self.out / "target"
+        fixture = target / "examples/pixel-art/restart.test.ts"
+        fixture.parent.mkdir(parents=True)
+        fixture.write_text("changed original fixture")
+        with self.assertRaisesRegex(RuntimeError, "fixture differs"):
+            restart_source(target, self.out, "before")
+        row = json.loads((self.out / "restart-source-before.json").read_text())
+        self.assertNotEqual(row["sha256"], run.RESTART_SHA256)
 
     def test_privacy_requires_raw_control_masking_reuse_and_progress(self):
         rows = [{"action": action, "rawAtMutation": ["596274"], "stale": {"text": []}, "publicReuse": {"text": ["596274"]}, "frameAtMutation": i + 1} for i, action in enumerate(("clear", "replace", "remove"))]
