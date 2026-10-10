@@ -27,7 +27,7 @@ jobs:
       WLR_RENDERER: pixman
       WLR_RENDERER_ALLOW_SOFTWARE: '1'
       LIBGL_ALWAYS_SOFTWARE: '1'
-      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.x86_64.json
+      VK_DRIVER_FILES: /usr/share/vulkan/icd.d/lvp_icd.json
       NO_COLOR: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
