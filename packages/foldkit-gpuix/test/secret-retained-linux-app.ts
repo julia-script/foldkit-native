@@ -10,6 +10,7 @@ import { mountGpuix } from '../src/index.ts'
 export type PrivacyMode = 'default-disabled' | 'opt-out' | 'enabled'
 type Surface = NativeRenderer & Pick<GpuixRenderer, 'getAllText' | 'getAutomationTree' | 'getDebugFrameOverlayStats' | 'focusElement' | 'simulateKeystrokes'>
 type App = ReturnType<typeof mountGpuix>
+type ControlNode = { id: number; type: string; text?: string; value?: string; children?: Array<ControlNode> }
 
 export const qualifyRetainedPrivacy = async (
   app: App, native: Surface, mode: PrivacyMode, listenersBefore: number,
@@ -80,10 +81,16 @@ export const qualifyRetainedPrivacy = async (
   }
 
   const feed: Array<(chunk: string) => void> = []
+  let wireTree: ControlNode | null | undefined
   const write = process.stdout.write.bind(process.stdout)
   process.stdout.write = ((chunk: string | Uint8Array) => {
     const text = typeof chunk === 'string' ? chunk : new TextDecoder().decode(chunk)
-    if (text.startsWith('data:')) { for (const callback of feed) callback(text); return true }
+    if (text.startsWith('data:')) {
+      const message = JSON.parse(text.slice('data:'.length).trim()) as { result?: { tree?: ControlNode | null } }
+      if (message.result !== undefined && 'tree' in message.result) wireTree = message.result.tree
+      for (const callback of feed) callback(text)
+      return true
+    }
     return write(chunk)
   }) as typeof process.stdout.write
   let client: Awaited<ReturnType<typeof connectStdio>> | undefined
@@ -94,10 +101,11 @@ export const qualifyRetainedPrivacy = async (
       const raw = native.getAllText()
       const rawTree = native.getAutomationTree()
       record(`${phase}-raw`, { raw, rawTree, frames: frames() })
-      const find = (node: { id: number; text?: string; children?: Array<unknown> }): typeof node | undefined => {
+      const find = (node: ControlNode | null): ControlNode | undefined => {
+        if (node === null) return undefined
         if (node.id === field.nativeId) return node
         for (const child of node.children ?? []) {
-          const found = find(child as typeof node)
+          const found = find(child)
           if (found !== undefined) return found
         }
         return undefined
@@ -105,11 +113,17 @@ export const qualifyRetainedPrivacy = async (
       assert(raw.includes(value), `${phase}: empty raw retained-secret echo`)
       assert.equal(find(JSON.parse(rawTree))?.text, value, `${phase}: missing raw input-content control`)
       const served = await text()
-      const tree = await client!.call('getTree', {})
-      record(phase, { raw, rawTree: JSON.parse(rawTree), served, tree, frames: frames() })
+      wireTree = undefined
+      const tree = await client!.call('getTree', {}) as { tree: ControlNode | null }
+      record(phase, { raw, rawTree: JSON.parse(rawTree), served, tree, wireTree, frames: frames() })
       assert(!served.text.some(part => part.includes(value)), `${phase}: secret leaked in SSE text`)
       assert(served.text.includes('•'.repeat([...value].length)), `${phase}: missing positive masked response`)
-      assert(!JSON.stringify(tree).includes(value), `${phase}: secret leaked in SSE tree`)
+      assert(wireTree !== undefined, `${phase}: missing SSE wire tree control`)
+      for (const servedTree of [tree.tree, wireTree]) {
+        const servedInput = find(servedTree)
+        assert(servedInput !== undefined && servedInput.type === 'input', `${phase}: missing served input control`)
+        assert(!('text' in servedInput) && !('value' in servedInput), `${phase}: input text/value leaked in SSE tree`)
+      }
     }
     for (const action of ['clear', 'replace', 'remove'] as const) {
       const field = makeField('596274')
@@ -117,9 +131,13 @@ export const qualifyRetainedPrivacy = async (
       // Retained content is independent of editor props.value. Supersede the
       // controlled echo before host submission samples its retirement fence.
       if (action === 'clear') {
-        field.value = ''; echo(field, ''); app.host.flush()
+        field.value = ''
+        await secretControl('clear-stale-before-submit', field, '596274')
+        echo(field, ''); app.host.flush()
       } else if (action === 'replace') {
-        field.value = '831905'; echo(field, '831905'); app.host.flush()
+        field.value = '831905'
+        await secretControl('replace-stale-before-submit', field, '596274')
+        echo(field, '831905'); app.host.flush()
         await secretControl('replacement-current-secret', field, '831905')
       } else { field.remove(); app.host.flush() }
       await advance(`${action}-completed-frame`)
