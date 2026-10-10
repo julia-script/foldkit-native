@@ -231,8 +231,14 @@ class Controls(unittest.TestCase):
                 (out / (role + '.stderr.log')).write_text('synthetic original error' if role == 'original' else 'synthetic permission denied')
             def poll(self):
                 self.count += 1
+                if mode == 'early-original' and self.role == 'original':
+                    return self.receipt['rawExit']
+                if mode in ('original-timeout', 'sampler-timeout'):
+                    return None
                 return None if self.role == 'original' and self.count <= 3 else self.receipt['rawExit']
             def wait(self, timeout):
+                if mode == 'sampler-wait-timeout':
+                    raise subprocess.TimeoutExpired(self.receipt['argv'], timeout)
                 return self.receipt['rawExit']
             def observe(self):
                 return {}
@@ -242,22 +248,44 @@ class Controls(unittest.TestCase):
                 return self.receipt
         source = {'head': 'synthetic-source'}
         deps = {'binary': BINARY}
-        for original_exit, sampler_exit in ((17, 13), (0, 13), (0, 0)):
-            out = self.out / (str(original_exit) + '-' + str(sampler_exit))
+        cases = [(17, 13, 'raw-fail'), (0, 13, 'sample-fail'), (0, 0, 'missing-report'),
+                 (-15, 0, 'original-timeout'), (0, -15, 'sampler-timeout'),
+                 (0, -15, 'sampler-wait-timeout'), (17, None, 'early-original'),
+                 (0, 0, 'source-drift'), (0, 0, 'binary-drift')]
+        for original_exit, sampler_exit, mode in cases:
+            out = self.out / mode
+            limits = {**m.LIMITS}
+            if mode == 'original-timeout':
+                limits['originalEnvelopeSeconds'] = -1
+            if mode == 'sampler-timeout':
+                limits['samplerEnvelopeSeconds'] = -1
+            source_after = {**source, 'head': 'different-source'} if mode == 'source-drift' else source
+            deps_after = {'binary': {**BINARY, 'sha256': '0' * 64}} if mode == 'binary-drift' else deps
             release = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'julia-script/foldkit-native',
                        'GITHUB_REF': 'refs/heads/julia/owned-native32-stack-measurement',
                        'GITHUB_EVENT_NAME': 'push', 'GITHUB_RUN_ATTEMPT': '1'}
             clean_env = {key: value for key, value in os.environ.items() if key not in ('FOLDKIT_NATIVE_NO_WINDOW', 'NAPI_RS_NATIVE_LIBRARY_PATH', 'BUN_PRELOAD', 'NODE_OPTIONS')}
             with patch.dict(os.environ, {**clean_env, **release}, clear=True), patch.object(os, 'uname', return_value=type('OS', (), {'sysname': 'Darwin'})()), \
-                 patch.object(m, 'source_identity', return_value=source), patch.object(m, 'dependency_identity', return_value=deps), \
+                 patch.object(m, 'source_identity', side_effect=[source, source_after]), patch.object(m, 'dependency_identity', side_effect=[deps, deps_after]), \
                  patch.object(m, 'read_command', side_effect=lambda argv: '1.3.9' if argv[0] == 'bun' else 'v22.22.3' if argv[0] == 'node' else 'synthetic nm'), \
-                 patch.object(m, 'Owned', FakeChild):
+                 patch.object(m, 'Owned', FakeChild), patch.object(m, 'LIMITS', limits):
                 actual_exit = m.run(out)
-                self.assertEqual(actual_exit, 17 if original_exit else 1, (out / 'result.json').read_text())
+                self.assertEqual(actual_exit, 128 - original_exit if original_exit < 0 else original_exit or 1, (out / 'result.json').read_text())
             result = json.loads((out / 'result.json').read_text())
             self.assertEqual(result['originalRawExit'], original_exit)
-            self.assertEqual(result['samplerRawExit'], sampler_exit)
-            self.assertEqual(result['originalVerdict'], 'fail' if original_exit else 'pass')
+            self.assertEqual(result['samplerRawExit'], None if mode in ('early-original', 'original-timeout') else sampler_exit)
+            self.assertEqual(result['originalVerdict'], 'unproved' if mode in ('source-drift', 'binary-drift') else 'fail' if original_exit else 'pass')
+            if mode == 'original-timeout':
+                self.assertTrue(result['originalEnvelopeExceeded'])
+            if mode == 'sampler-timeout':
+                self.assertTrue(result['samplerEnvelopeExceeded'])
+            if mode in ('sampler-wait-timeout', 'original-timeout', 'sampler-timeout'):
+                self.assertIn('Timeout', result['error'])
+            if mode == 'early-original':
+                self.assertIn('sampler not launched', result['error'])
+                self.assertFalse((out / 'sampler-process.json').exists())
+            if mode in ('source-drift', 'binary-drift'):
+                self.assertIn('identity changed', result['evidenceError'])
             self.assertFalse(result['completeEvidence'])
             self.assertTrue((out / 'manifest.json').exists())
             self.assertEqual((out / 'original.stderr.log').read_text(), 'synthetic original error')
