@@ -1,0 +1,51 @@
+name: Owned native32 stack measurement
+on:
+  push:
+    branches: [julia/owned-native32-stack-measurement]
+permissions:
+  contents: read
+concurrency:
+  group: owned-native32-stack-measurement
+  cancel-in-progress: false
+jobs:
+  original32:
+    if: ${{ github.repository == 'julia-script/foldkit-native' && github.ref == 'refs/heads/julia/owned-native32-stack-measurement' }}
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Reserve unique early-failure evidence
+        run: |
+          mkdir "$RUNNER_TEMP/native32-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          printf '%s\n' "$GITHUB_SHA" > "$RUNNER_TEMP/native32-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/workflow-head.txt"
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22.22.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.3.9
+      - run: npm ci
+      - name: One unchanged original32 and owned-PID sample
+        run: python3 scripts/owned-native32-stack/measure.py --out "$RUNNER_TEMP/native32-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/measurement"
+      - name: Preserve separate workflow result
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          python3 - <<'PY'
+          import os,json
+          from pathlib import Path
+          p=Path(os.environ['RUNNER_TEMP'])/('native32-'+os.environ['GITHUB_RUN_ID']+'-'+os.environ['GITHUB_RUN_ATTEMPT'])
+          p.mkdir(exist_ok=True)
+          with (p/'workflow-result.json').open('x') as f:
+              json.dump({'head':os.environ['GITHUB_SHA'],'run':os.environ['GITHUB_RUN_ID'],'attempt':os.environ['GITHUB_RUN_ATTEMPT'],'status':os.environ['JOB_STATUS']},f)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: native32-stack-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/native32-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 7
