@@ -267,7 +267,14 @@ def validate_report(raw, original, sampler, binary, synthetic=False):
     require(sampler['argv'][:6] == ['/usr/bin/sample', str(pid), '25', '10', '-mayDie', '-file'] and len(sampler['argv']) == 7, 'sampler argv/PID drift')
     require(re.search(r'^Process:\s+bun \[' + str(pid) + r'\]\s*$', raw, re.M), 'report PID/name not original owned Bun')
     require('Call graph:' in raw and 'Binary Images:' in raw, 'missing stack/image sections')
-    require(re.search(r'^\s*[+|:! ]*\d+\s+\S+', raw.split('Call graph:', 1)[1].split('Binary Images:', 1)[0], re.M), 'empty/malformed stack tree')
+    tree = raw.split('Call graph:', 1)[1].split('Binary Images:', 1)[0]
+    positive_frames = []
+    for line in tree.splitlines():
+        frame = re.fullmatch(r'[\t +|:!]*(\d+)\s+\S.*?\s+\(in ([^\r\n()]+)\)'
+                             r'(?:\s+\+\s+\d+)?(?:\s+\[0x[0-9a-fA-F]+\])?\s*', line)
+        if frame and int(frame[1]) > 0:
+            positive_frames.append((line, frame[2]))
+    require(positive_frames, 'empty/malformed stack tree: no positive image-linked frames')
     image = [line for line in raw.split('Binary Images:', 1)[1].splitlines() if line.rstrip().endswith(binary['path'])]
     require(len(image) == 1 and '<' + binary['uuid'] + '>' in image[0].upper(), 'loaded-image UUID/path differs from hashed installed binary')
     require(binary['sha256'] == NATIVE_SHA, 'report linkage has wrong installed binary hash')
@@ -279,8 +286,7 @@ def validate_report(raw, original, sampler, binary, synthetic=False):
     require(first - 1 <= when <= last + 1, 'stale report timestamp outside owned sampling interval')
     image_name = re.match(r'\s*0x[0-9a-f]+\s*-\s*0x[0-9a-f]+\s+\+?(\S+)', image[0], re.I)
     require(image_name is not None, 'malformed loaded-image address/name')
-    frames = [line for line in raw.split('Call graph:', 1)[1].split('Binary Images:', 1)[0].splitlines()
-              if '(in ' + image_name[1] + ')' in line]
+    frames = [line for line, name in positive_frames if name == image_name[1]]
     return {'reportPID': pid, 'loadedImage': image[0], 'installedBinary': binary,
             'nativeImageFrameLines': frames, 'symbolAttributionAvailable': bool(frames),
             'samplingInterval': [sampler['start'], sampler['end']], 'phaseUncertainty': LIMITS['phaseUncertainty'],
@@ -291,7 +297,8 @@ def test_verdict(raw, receipt):
     clean = re.sub(r'\x1b\[[0-9;]*m', '', raw)
     rows = re.findall(r'^\((pass|fail|skip)\) (.+)$', clean, re.M)
     executed = [(kind, name) for kind, name in rows if kind != 'skip']
-    require(len(executed) == 1 and TITLE in executed[0][1] and 'Metal, offscreen' in executed[0][1], 'original32 did not execute exactly once, or other tests executed')
+    expected = re.escape('Metal, offscreen > ' + TITLE) + r'(?: \[\d+(?:\.\d+)?ms\])?'
+    require(len(executed) == 1 and re.fullmatch(expected, executed[0][1]), 'original32 did not execute exactly once, or other tests executed')
     if receipt['rawExit'] == 0:
         require(executed[0][0] == 'pass' and re.search(r'\b33 expect\(\) calls', clean), 'passing original lacks unchanged 33 assertions')
         return 'pass'

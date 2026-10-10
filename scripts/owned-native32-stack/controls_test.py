@@ -134,6 +134,32 @@ class Controls(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, 'synthetic'):
             m.validate_report(report(), original, sample, BINARY, synthetic=True)
 
+    def test_positive_structural_stacks_and_native_attribution(self):
+        original, sample = receipts()
+        native = '    5 build_element (in gpuix-native.darwin-arm64.node)'
+        shapes = {
+            'zero-only': native.replace('5 build', '0 build'),
+            'junk-only': '    1 NOT-A-CALL-TREE-ROW',
+            'negative-only': native.replace('5 build', '-5 build'),
+            'missing-image': '    1 build_element',
+            'empty-image': '    1 build_element (in )',
+        }
+        evidence = {'classification': 'synthetic parser controls; not physical stacks', 'rejected': {}}
+        for name, frame in shapes.items():
+            with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, 'positive image-linked') as rejected:
+                m.validate_report(report().replace(native, frame), original, sample, BINARY)
+            evidence['rejected'][name] = str(rejected.exception)
+        other = '    + 5 start (in libdyld.dylib) + 12 [0x1000]'
+        value = m.validate_report(report().replace(native, native.replace('5 build', '0 build') + '\n' + other), original, sample, BINARY)
+        self.assertFalse(value['symbolAttributionAvailable'])
+        self.assertEqual(value['nativeImageFrameLines'], [])
+        decorated = m.validate_report(report().replace(native, '    | + 5 build_element (in gpuix-native.darwin-arm64.node) + 123 [0x1000]'), original, sample, BINARY)
+        self.assertTrue(decorated['symbolAttributionAvailable'])
+        evidence['validNonNative'] = value
+        evidence['validDecoratedNative'] = decorated
+        self.out.mkdir()
+        m.save(self.out, 'structural-parser-controls', evidence)
+
     def test_wrong_stale_report_pid_loaded_uuid_path_hash_stack_and_interval_reject(self):
         original, sample = receipts()
         malformed = [report(123), report().replace(UUID, 'A' * 36),
@@ -160,6 +186,25 @@ class Controls(unittest.TestCase):
         for raw in (passed.replace('33 expect()', '32 expect()'), passed + '(pass) keyboard\n', passed.replace('(pass)', '(skip)'), '0 pass'):
             with self.assertRaises(RuntimeError):
                 m.test_verdict(raw, {'rawExit': 0})
+
+    def test_exact_original_saved_outcomes_and_wrong_title_rejection(self):
+        # Existing immutable raw Bun outcomes, not new native executions.
+        passed = '(pass) Metal, offscreen > ' + m.TITLE + ' [29647.93ms]\n33 expect() calls\n'
+        failed = '(fail) Metal, offscreen > ' + m.TITLE + ' [30121.73ms]\n1 expect() calls\n'
+        self.assertEqual(m.test_verdict(passed, {'rawExit': 0}), 'pass')
+        self.assertEqual(m.test_verdict(failed, {'rawExit': 1}), 'fail')
+        self.assertEqual(m.test_verdict('\x1b[32m' + passed + '\x1b[0m', {'rawExit': 0}), 'pass')
+        wrong = ['WRONG TEST ' + m.TITLE + ' > OTHER', m.TITLE + ' suffix',
+                 m.TITLE + ' [not-a-time]', m.TITLE + ' [29647.93ms] > OTHER']
+        rejected = {}
+        for title in wrong:
+            raw = '(pass) Metal, offscreen > ' + title + '\n33 expect() calls\n'
+            with self.subTest(title=title), self.assertRaisesRegex(RuntimeError, 'exactly once') as error:
+                m.test_verdict(raw, {'rawExit': 0})
+            rejected[title] = str(error.exception)
+        self.out.mkdir()
+        m.save(self.out, 'exact-outcome-controls', {'classification': 'saved line/parser replay; not new native execution',
+               'savedPassLine': passed, 'savedFailLine': failed, 'rejected': rejected})
 
     def spawn_harmless(self, program, role):
         self.out.mkdir(exist_ok=True)
