@@ -26,6 +26,70 @@ class Contrast(unittest.TestCase):
         path.mkdir(exist_ok=True)
         original.save(path, 'result', {'head': original.HEAD, 'case': case, 'status': status, 'error': 'original guard' if status == 'failed' else None})
         original.save(path, 'native-readme', {'pid': pid, 'exit': 1 if status == 'failed' else 0, 'status': 'command-failed' if status == 'failed' else 'passed', 'leaked': [], 'survivors': [], 'cleanupError': None})
+        source = {'head': original.HEAD, 'clean': '', 'readmeSHA256': original.README, 'lockSHA256': original.LOCK, 'snippetSHA256': original.SNIPPET}
+        driver = {'head': 'd'*40, 'clean': '', 'files': {'witness.ts': 'a'*64}}
+        dependencies = {'packages': {name: {'name': name, 'version': version, 'packageSHA256': 'a'*64} for name, version in original.PINS.items()},
+                        'binary': {'package': '@gpuix/native-darwin-arm64', 'version': '0.10.0', 'file': 'mock.node', 'sha256': 'a'*64}}
+        for phase in ['before', 'after']:
+            original.save(path, 'source-'+phase, source)
+            original.save(path, 'driver-'+phase, driver)
+            original.save(path, 'dependencies-'+phase, dependencies)
+        original.save(path, 'native-binary', dependencies['binary'])
+        original.save(path, 'native-binary-after', dependencies['binary'])
+
+    def test_cross_case_identical_inputs_pass_and_different_frozen_inputs_reject(self):
+        self.child('original'); self.child('control', pid=124)
+        self.assertEqual(runner.summarize(self.out)['status'], 'passed')
+        for kind in ['binary', 'package', 'source', 'driver']:
+            self.child('control', pid=124)
+            for phase in ['before', 'after']:
+                name = 'dependencies' if kind in ['binary', 'package'] else kind
+                data = json.loads((self.out / f'control/{name}-{phase}.json').read_text())
+                if kind == 'binary': data['binary']['sha256'] = 'b'*64
+                elif kind == 'package': data['packages']['effect']['packageSHA256'] = 'b'*64
+                elif kind == 'source': data['readmeSHA256'] = 'b'*64
+                else: data['files']['witness.ts'] = 'b'*64
+                original.save(self.out / 'control', name+'-'+phase, data)
+                if kind == 'binary': original.save(self.out / 'control', 'native-binary' if phase == 'before' else 'native-binary-after', data['binary'])
+            with self.subTest(kind=kind), self.assertRaises((RuntimeError, KeyError)): runner.summarize(self.out)
+
+    def test_missing_or_per_case_identity_drift_rejects_without_rewriting_case_error_exit(self):
+        for name in ['source-before', 'source-after', 'driver-before', 'driver-after', 'dependencies-before', 'dependencies-after', 'native-binary', 'native-binary-after']:
+            self.child('original', 'failed'); self.child('control', pid=124)
+            frozen = (self.out / 'original/result.json').read_bytes(), (self.out / 'original/native-readme.json').read_bytes()
+            (self.out / 'control' / (name+'.json')).unlink()
+            with self.subTest(name=name), self.assertRaises((RuntimeError, FileNotFoundError)): runner.summarize(self.out)
+            self.assertEqual(frozen, ((self.out / 'original/result.json').read_bytes(), (self.out / 'original/native-readme.json').read_bytes()))
+        self.child('control', pid=124)
+        packet = json.loads((self.out / 'control/dependencies-after.json').read_text()); packet['binary']['sha256'] = 'b'*64
+        original.save(self.out / 'control', 'dependencies-after', packet)
+        with self.assertRaises(RuntimeError): runner.summarize(self.out)
+
+    def test_aggregate_identity_failure_preserves_original_case_error_exit_and_manifests(self):
+        frozen = {}
+        def run(_root, destination, case):
+            self.child(case, 'failed' if case == 'original' else 'passed', 123 if case == 'original' else 124)
+            if case == 'original':
+                frozen['result'] = (destination / 'result.json').read_bytes()
+                frozen['child'] = (destination / 'native-readme.json').read_bytes()
+                raise RuntimeError('original native guard failed')
+            for phase in ['before', 'after']:
+                packet = json.loads((destination / f'dependencies-{phase}.json').read_text())
+                packet['binary']['sha256'] = 'b'*64
+                original.save(destination, 'dependencies-'+phase, packet)
+                original.save(destination, 'native-binary' if phase == 'before' else 'native-binary-after', packet['binary'])
+        with patch.object(original, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'identities differ'): runner.run(self.out, self.out)
+        aggregate = json.loads((self.out / 'result.json').read_text())
+        self.assertEqual(aggregate['status'], 'failed')
+        self.assertIn('identities differ', aggregate['error'])
+        self.assertEqual(aggregate['cases']['original']['error'], 'original guard')
+        self.assertEqual(aggregate['cases']['control']['status'], 'passed')
+        self.assertEqual(frozen['result'], (self.out / 'original/result.json').read_bytes())
+        self.assertEqual(frozen['child'], (self.out / 'original/native-readme.json').read_bytes())
+        manifest = json.loads((self.out / 'manifest.json').read_text())
+        self.assertIn('original/dependencies-before.json', manifest)
+        self.assertIn('control/native-binary-after.json', manifest)
 
     def test_control_pass_does_not_accept_failed_original(self):
         self.child('original', 'failed', 123)

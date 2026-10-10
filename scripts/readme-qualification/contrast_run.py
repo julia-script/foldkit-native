@@ -70,6 +70,32 @@ def validate_control(out):
                      'Count1 pixels did not change after genuine input')
 
 
+def identities(out):
+    recorded = {}
+    for name in ('source', 'driver', 'dependencies'):
+        before = json.loads((out / f'{name}-before.json').read_text())
+        after = json.loads((out / f'{name}-after.json').read_text())
+        original.require(before == after, f'{out.name}: {name} identity changed within case')
+        recorded[name] = before
+    source, driver, dependencies = recorded['source'], recorded['driver'], recorded['dependencies']
+    original.require(source == {'head': original.HEAD, 'clean': '', 'readmeSHA256': original.README,
+                                'lockSHA256': original.LOCK, 'snippetSHA256': original.SNIPPET}, 'missing/wrong frozen source identity')
+    original.require(original.re.fullmatch('[0-9a-f]{40}', driver['head']) and driver['clean'] == '' and
+                     driver['files'] and all(original.re.fullmatch('[0-9a-f]{64}', value) for value in driver['files'].values()),
+                     'missing/wrong frozen driver identity')
+    packages = dependencies['packages']
+    original.require(set(packages) == set(original.PINS) and
+                     all(info['name'] == name and info['version'] == original.PINS[name] and
+                         original.re.fullmatch('[0-9a-f]{64}', info['packageSHA256']) for name, info in packages.items()),
+                     'missing/wrong package identities')
+    binary = dependencies['binary']
+    original.require(binary['package'] == '@gpuix/native-darwin-arm64' and binary['version'] == original.PINS[binary['package']] and
+                     binary['file'].endswith('.node') and original.re.fullmatch('[0-9a-f]{64}', binary['sha256']), 'missing/wrong native binary identity')
+    for name in ('native-binary', 'native-binary-after'):
+        original.require(json.loads((out / f'{name}.json').read_text()) == binary, 'native binary receipt differs from dependencies')
+    return recorded
+
+
 def summarize(out):
     cases = {case: json.loads((out / case / 'result.json').read_text()) for case in ('original', 'control')}
     for case in cases:
@@ -89,9 +115,12 @@ def summarize(out):
             if 'pid' in child:
                 pids.append(child['pid'])
     original.require(len(pids) == len(set(pids)), 'cases reused a native PID')
+    frozen = identities(out / 'original')
+    original.require(identities(out / 'control') == frozen, 'original/control source/driver/package/native binary identities differ')
     return {'status': 'passed' if all(c['status'] == 'passed' for c in cases.values()) else 'failed',
             'originalAcceptance': cases['original']['status'], 'controlDiagnostic': cases['control']['status'],
-            'cases': cases, 'pids': pids}
+            'cases': cases, 'pids': pids, 'sameInputs': True,
+            'identitySHA256': original.sha(json.dumps(frozen, sort_keys=True).encode())}
 
 
 def run(root, out):
@@ -117,6 +146,17 @@ def run(root, out):
         result = summarize(out)
         original.save(out, 'result', result)
         original.require(result['status'] == 'passed', 'original/control diagnostics contain a failed case; no original acceptance')
+    except BaseException as error:
+        # Preserve each case's original error/exit/artifacts. Record aggregate
+        # identity/result failures separately, without replacing the exception.
+        try:
+            failure = json.loads((out / 'result.json').read_text())
+            failure.update(status='failed', phase='cases-or-identity', error=repr(error))
+            failure['cases'] = {case: json.loads((out / case / 'result.json').read_text()) for case in ('original', 'control') if (out / case / 'result.json').exists()}
+            original.save(out, 'result', failure)
+        except Exception:
+            pass
+        raise
     finally:
         original.save(out, 'manifest', {str(p.relative_to(out)): original.sha(p.read_bytes()) for p in out.rglob('*') if p.is_file() and p != out / 'manifest.json'})
 
