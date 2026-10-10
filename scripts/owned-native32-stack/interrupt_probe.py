@@ -19,7 +19,8 @@ def descendants(rows, root):
         if not added:
             break
         found |= added
-    return {pid: m.token(rows[pid]) for pid in found if pid in rows and not rows[pid]['state'].startswith('Z')}
+    return {pid: m.token(rows[pid]) for pid in found if pid in rows
+            and not rows[pid]['state'].startswith('Z') and not rows[pid]['command'].startswith('(')}
 
 
 def probe(out, head):

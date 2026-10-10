@@ -71,8 +71,11 @@ def observe_nested(child, known):
         added = False
         for pid, row in rows.items():
             if row['ppid'] in parents and pid not in parents and not row['state'].startswith('Z'):
-                m.require(pid not in known or known[pid] == m.token(row), 'reused nested preparation identity')
-                known[pid] = m.token(row)
+                # Inspection commands stay in the step's group. Track the
+                # separately-sessioned Owned children and their descendants.
+                if row['pgid'] != child.child.pid and not row['command'].startswith('('):
+                    m.require(pid not in known or known[pid] == m.token(row), 'reused nested preparation identity')
+                    known[pid] = m.token(row)
                 parents.add(pid)
                 added = True
         if not added:

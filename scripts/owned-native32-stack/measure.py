@@ -153,7 +153,7 @@ class Owned:
                 self.receipt['identity'] = row
             # Same newly-created session/group while its known leader is live.
             for pid, member in rows.items():
-                if member['pgid'] == self.child.pid:
+                if member['pgid'] == self.child.pid and not member['state'].startswith('Z') and not member['command'].startswith('('):
                     require(pid not in self.known or self.known[pid] == token(member), 'stale owned group member identity')
                     self.known[pid] = token(member)
             self.receipt['observedGroupMembers'] = dict(self.known)
@@ -168,8 +168,14 @@ class Owned:
         return self.receipt['identity']
 
     def send(self, sig):
-        rows = self.observe()
-        members = [row for row in rows.values() if row['pgid'] == self.child.pid and not row['state'].startswith('Z')]
+        until = time.monotonic() + 2
+        while True:
+            rows = self.observe()
+            members = [row for row in rows.values() if row['pgid'] == self.child.pid and not row['state'].startswith('Z')]
+            if not any(row['command'].startswith('(') for row in members):
+                break
+            require(time.monotonic() < until, 'unresolved group identity: signal refused')
+            time.sleep(.01)
         require(all(self.known.get(row['pid']) == token(row) for row in members), 'unverified group member: cleanup refused')
         if members:
             try:
