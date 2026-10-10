@@ -20,6 +20,7 @@ import time
 import zlib
 
 sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 from contract import BASE, CANDIDATE, CASES, COMMAND, DELTA, DRIVER, METHODS, BLOCK_ENV, digest, validate_all, exit_code
 from supervise import supervise
 
@@ -107,7 +108,11 @@ def png_receipt(path):
 
 def seed(out):
     out.mkdir(parents=True, exist_ok=False)
-    receipt = {"stage": "startup", "executionKind": "unproved", "driverHead": None}
+    receipt = {"stage": "startup", "executionKind": "unproved", "driverHead": None, "driverPorcelain": None,
+               "githubHead": os.environ.get("GITHUB_SHA"), "githubRepository": os.environ.get("GITHUB_REPOSITORY"),
+               "githubRunId": os.environ.get("GITHUB_RUN_ID"), "platform": platform.system(), "machine": platform.machine(),
+               "python": {"executable": sys.executable, "version": sys.version, "cachePrefix": getattr(sys, "pycache_prefix", None),
+                          "bytecodeDisabled": sys.dont_write_bytecode, "inheritedBytecodePolicy": os.environ.get("PYTHONDONTWRITEBYTECODE")}}
     cases = {}
     for name, head in CASES.items():
         folder = out / name
@@ -157,6 +162,7 @@ def execute(root, out, receipt, cases, expected, owned):
     receipt["stage"] = "preflight"
     head = git(root, "rev-parse", "HEAD")
     receipt["driverHead"] = head
+    receipt["driverPorcelain"] = subprocess.check_output(["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"], text=True, timeout=20)
     driver = expected_source(root, head)
     source_identity(root, driver)
     if git(root, "merge-base", CANDIDATE, head) != CANDIDATE:

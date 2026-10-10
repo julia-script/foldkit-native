@@ -19,6 +19,7 @@ import zlib
 from unittest.mock import patch
 
 sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 import contract as c
 import run
 import supervise as s
@@ -40,6 +41,88 @@ def fixtures(baseline="pass", candidate="pass"):
 
 
 class Evidence(unittest.TestCase):
+    def test_ordinary_main_rejection_persists_full_startup_state_without_children(self):
+        root = Path(__file__).resolve().parents[2]
+        env = dict(os.environ)
+        for name in ('PYTHONDONTWRITEBYTECODE', 'PYTHONPYCACHEPREFIX', 'GITHUB_ACTIONS', 'GITHUB_REPOSITORY', 'GITHUB_SHA'):
+            env.pop(name, None)
+        with tempfile.TemporaryDirectory() as directory:
+            out = Path(directory) / 'evidence'
+            command = [sys.executable, str(root / 'scripts/native-geometry-comparison/run.py'), '--out', str(out)]
+            result = subprocess.run(command, cwd=root, env=env, text=True, capture_output=True, timeout=30)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            state = json.loads((out / 'provenance.json').read_text())
+            self.assertEqual(state['driverHead'], run.git(root, 'rev-parse', 'HEAD'))
+            self.assertEqual(state['driverPorcelain'], subprocess.check_output(['git', '-C', str(root), 'status', '--porcelain', '--untracked-files=all'], text=True))
+            self.assertIsNone(state['githubHead'])
+            self.assertTrue(state['python']['bytecodeDisabled'])
+            self.assertEqual(state['python']['inheritedBytecodePolicy'], '1')
+            self.assertNotIn('installSupervision', state)
+            for name in c.CASES:
+                case = json.loads((out / name / 'case.json').read_text())
+                self.assertFalse(case['supervision']['started'])
+                self.assertFalse(case['capabilitySupervision']['started'])
+            self.assertFalse(list((root / 'scripts/native-geometry-comparison').rglob('*.pyc')))
+
+    def test_ordinary_startup_and_owned_python_import_leave_no_adjacent_cache(self):
+        source = Path(__file__).resolve().parent
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("run.py", "contract.py", "supervise.py"):
+                (root / name).write_bytes((source / name).read_bytes())
+            code = f"""import sys, runpy, os
+from pathlib import Path
+sys.pycache_prefix = None
+sys.path.insert(0, {str(root)!r})
+runpy.run_path({str(root / 'run.py')!r}, run_name='startup_probe')
+import supervise
+state = supervise.supervise([sys.executable, '-c', 'import contract,sys;assert sys.dont_write_bytecode'], Path({str(root / 'child.log')!r}), os.environ)
+assert state['returncode'] == 0 and state['reaped'] and state['groupClean']
+"""
+            env = dict(os.environ)
+            env.pop('PYTHONDONTWRITEBYTECODE', None)
+            env.pop('PYTHONPYCACHEPREFIX', None)
+            child = subprocess.run([sys.executable, '-c', code], cwd=root, env=env, text=True, capture_output=True, timeout=10)
+            self.assertEqual(child.returncode, 0, child.stderr)
+            self.assertFalse(list(root.rglob('*.pyc')))
+            self.assertFalse(list(root.rglob('__pycache__')))
+
+    def test_real_tracked_untracked_and_wrong_head_reject_with_startup_state(self):
+        source = Path(__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'owned-clone'
+            subprocess.run(['git', 'clone', '--shared', '--quiet', str(source), str(root)], check=True, timeout=30)
+            head = run.git(root, 'rev-parse', 'HEAD')
+            tracked = root / '.github/workflows/native-geometry-comparison.yml'
+            original = tracked.read_bytes()
+            for mode in ('tracked', 'untracked', 'wrong-head'):
+                if mode == 'tracked':
+                    tracked.write_bytes(original + b'\n# owned tracked drift\n')
+                elif mode == 'untracked':
+                    (root / 'owned-extra').mkdir()
+                    for name in ('one', 'two'):
+                        (root / 'owned-extra' / name).write_text('owned untracked drift')
+                env = {'GITHUB_ACTIONS': 'true', 'GITHUB_REPOSITORY': 'julia-script/foldkit-native', 'GITHUB_RUN_ID': '123', 'GITHUB_SHA': '0' * 40}
+                with patch.dict(os.environ, env), patch.object(run, 'supervise', side_effect=AssertionError('non-git child must not start')) as spawn:
+                    receipt, cases = run.seed(Path(directory) / (mode + '-state'))
+                    with self.assertRaisesRegex(RuntimeError, 'source head or clean tree changed' if mode != 'wrong-head' else 'released exact-head hosted'):
+                        run.execute(root, Path(directory) / (mode + '-state'), receipt, cases, {}, {})
+                self.assertEqual(spawn.call_count, 0)
+                self.assertEqual(receipt['driverHead'], head)
+                self.assertEqual(receipt['githubHead'], '0' * 40)
+                self.assertTrue(receipt['python']['bytecodeDisabled'])
+                self.assertEqual(receipt['python']['inheritedBytecodePolicy'], '1')
+                if mode == 'tracked':
+                    self.assertIn(' M .github/workflows/native-geometry-comparison.yml', receipt['driverPorcelain'])
+                    tracked.write_bytes(original)
+                elif mode == 'untracked':
+                    for name in ('one', 'two'):
+                        self.assertIn('?? owned-extra/' + name, receipt['driverPorcelain'])
+                        (root / 'owned-extra' / name).unlink()
+                    (root / 'owned-extra').rmdir()
+                else:
+                    self.assertEqual(receipt['driverPorcelain'], '')
+
     def test_positive_modeled_predicates_not_native_qualification(self):
         result = c.validate_all(*fixtures())
         self.assertTrue(result["completeComparisonEvidence"])
@@ -155,6 +238,13 @@ class Evidence(unittest.TestCase):
             files = ["provenance.json", "error.json", "cleanup.json", "comparison.json", "baseline/case.json", "candidate/case.json"]
             self.assertTrue(all((out / name).exists() for name in files))
             summary = json.loads((out / "comparison.json").read_text())
+            provenance = json.loads((out / "provenance.json").read_text())
+            self.assertEqual(provenance['python']['executable'], sys.executable)
+            self.assertTrue(provenance['python']['bytecodeDisabled'])
+            self.assertEqual(provenance['python']['inheritedBytecodePolicy'], '1')
+            self.assertIn('driverHead', provenance)
+            self.assertIn('driverPorcelain', provenance)
+            self.assertIn('githubHead', provenance)
             self.assertFalse(summary["completeComparisonEvidence"])
             self.assertNotEqual(result, 0)
             return result, summary
