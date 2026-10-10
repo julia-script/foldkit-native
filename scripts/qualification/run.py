@@ -108,6 +108,32 @@ def nonempty(path):
     require(path.is_file() and path.stat().st_size > 0, f"missing output: {path}")
 
 
+def cart_inputs(out):
+    inputs = json.loads((out / "cart-inputs.json").read_text())
+    delivered = [row for row in inputs if row["kind"] == "delivered"]
+    observed = [row for row in inputs if row["kind"] == "observed"]
+    expected = ["Checkout", "Products"]
+    for order in range(1, 4):
+        expected += ["Add to Cart", "Checkout", "Place Order"]
+        if order < 3:
+            expected += ["Continue Shopping" if order == 1 else "Products", "Checkout", "Products"]
+    require([row["label"] for row in delivered] == expected and
+            [(row["label"], row["id"], row["point"]) for row in observed] ==
+            [(row["label"], row["id"], row["point"]) for row in delivered], "missing native Cart delivery/state controls")
+    for row in delivered:
+        x, y = row["point"]["x"], row["point"]["y"]
+        target, viewport = row["bounds"], row["viewport"]
+        require(0 < x < viewport["width"] and 0 < y < viewport["height"] and
+                target["x"] < x < target["x"] + target["width"] and
+                target["y"] < y < target["y"] + target["height"], "out-of-window/target Cart input")
+    for row in observed:
+        require(row["before"]["text"] != row["after"]["text"] and row["after"]["painted"], "missing native Cart observable state change")
+    frames = json.loads((out / "cart-frame-measurements.json").read_text())
+    require(len(frames) >= len(delivered), "missing measured native frame controls")
+    for frame in frames:
+        nonempty(Path(frame["path"]))
+
+
 def privacy_output(out):
     files = list(out.glob("privacy-child-*.json"))
     require(len(files) == 1, "expected one captured original privacy child")
@@ -180,12 +206,18 @@ def qualify(case, target, out):
     run(["npm", "ci"], "npm-ci", 180)
     run(["npm", "ls", "--depth=0"], "dependencies", 20)
     if case == "70":
+        # Compile a read-only AppKit/CoreGraphics metadata probe outside both
+        # checkouts. It opens no window and never sends input to production.
+        probe = out / "macos-frame"
+        run(["swiftc", str(HERE / "macos-frame.swift"), "-o", str(probe)], "frame-probe-compile", 60)
+        env["QUALIFICATION_FRAME_PROBE"] = str(probe)
         run(["bun", str(HERE / "cart.ts")], "native-cart", 90)
         rows = json.loads((out / "cart-observations.json").read_text())
         required = ["empty-checkout", "first-instructions"] + [f"order-{i}-{stage}" for i in range(1, 4) for stage in ("ready", "success")] + [f"order-{i}-confirmation-retained" for i in (1, 2)]
         require([row["label"] for row in rows] == ["empty-checkout", "order-1-ready", "first-instructions", "order-1-success", "order-1-confirmation-retained", "order-2-ready", "order-2-success", "order-2-confirmation-retained", "order-3-ready", "order-3-success"], "incomplete native Cart observations")
         for label in required:
             nonempty(out / f"{label}.png")
+        cart_inputs(out)
     elif case == "71":
         run(["brew", "install", "ffmpeg"], "ffmpeg-install", 300)
         run(["ffmpeg", "-version"], "ffmpeg-version", 10)

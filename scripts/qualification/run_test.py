@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 import run
-from run import command, privacy_output, test_passed, theme_states
+from run import cart_inputs, command, privacy_output, test_passed, theme_states
 
 
 class Controls(unittest.TestCase):
@@ -97,6 +97,32 @@ class Controls(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             theme_states(dark * 6, self.out / "failed-transitions.json")
         self.assertEqual(len(json.loads((self.out / "failed-transitions.json").read_text())["samples"]), 6)
+
+    def test_cart_requires_in_window_delivery_state_changes_and_complete_paths(self):
+        labels = ["Checkout", "Products", "Add to Cart", "Checkout", "Place Order", "Continue Shopping", "Checkout", "Products", "Add to Cart", "Checkout", "Place Order", "Products", "Checkout", "Products", "Add to Cart", "Checkout", "Place Order"]
+        delivered = [{"kind": "delivered", "label": label, "id": i, "point": {"x": 410, "y": 645.5}, "bounds": {"x": 350, "y": 638, "width": 120, "height": 32}, "viewport": {"width": 760, "height": 653}} for i, label in enumerate(labels)]
+        observed = [{"kind": "observed", "label": row["label"], "id": row["id"], "point": dict(row["point"]), "before": {"text": ["before"]}, "after": {"text": ["after"], "painted": ["after"]}} for row in delivered]
+        (self.out / "measured.png").write_bytes(b"mock frame; not native evidence")
+        (self.out / "cart-frame-measurements.json").write_text(json.dumps([{"path": str(self.out / "measured.png")}] * len(labels)))
+        path = self.out / "cart-inputs.json"
+        def write():
+            path.write_text(json.dumps(delivered + observed))
+        write()
+        cart_inputs(self.out)
+        # Original centre654 must fail even if a matching acknowledgment exists.
+        delivered[0]["point"]["y"] = observed[0]["point"]["y"] = 654
+        write()
+        with self.assertRaisesRegex(RuntimeError, "out-of-window"):
+            cart_inputs(self.out)
+        delivered[0]["point"]["y"] = observed[0]["point"]["y"] = 645.5
+        observed[0]["after"]["text"] = ["before"]
+        write()
+        with self.assertRaisesRegex(RuntimeError, "observable state"):
+            cart_inputs(self.out)
+        observed.pop()
+        write()
+        with self.assertRaisesRegex(RuntimeError, "delivery/state"):
+            cart_inputs(self.out)
 
 
 if __name__ == "__main__":
