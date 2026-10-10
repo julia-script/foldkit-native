@@ -5,6 +5,7 @@ import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import type { mountGpuix, NativeElement } from 'foldkit-gpuix'
 import { context, measure, pixels, sameScene, styles } from './contrast.ts'
+import { readCapturePng } from './png.ts'
 
 type Box = { x: number; y: number; width: number; height: number }
 type Size = { width: number; height: number }
@@ -160,7 +161,7 @@ export function begin() {
         const after = context(app!, renderer, count, measure(process.env['QUALIFICATION_FRAME_PROBE']!))
         writeDiagnostic(out, `${name}-contrast-after`, after)
         sameScene(before, after)
-        const decoded = pixels(readPng(shot.path), after)
+        const decoded = pixels(readCapturePng(shot.path), after)
         writeDiagnostic(out, `${name}-contrast-pixels`, { ...decoded, pngSHA256: createHash('sha256').update(readFileSync(shot.path)).digest('hex') })
       }
       return shot
