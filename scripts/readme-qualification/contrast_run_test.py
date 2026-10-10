@@ -1,0 +1,160 @@
+"""Result/source fault controls only. No GPUI or real native evaluation."""
+import copy
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).parent))
+import contrast_run as runner
+import run as original
+import run_test as fixtures
+
+
+class Contrast(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.out = Path(self.temp.name)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def child(self, case, status='passed', pid=123):
+        path = self.out / case
+        path.mkdir(exist_ok=True)
+        original.save(path, 'result', {'head': original.HEAD, 'case': case, 'status': status, 'error': 'original guard' if status == 'failed' else None})
+        original.save(path, 'native-readme', {'pid': pid, 'exit': 1 if status == 'failed' else 0, 'status': 'command-failed' if status == 'failed' else 'passed', 'leaked': [], 'survivors': [], 'cleanupError': None})
+
+    def test_control_pass_does_not_accept_failed_original(self):
+        self.child('original', 'failed', 123)
+        self.child('control', 'passed', 124)
+        result = runner.summarize(self.out)
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(result['originalAcceptance'], 'failed')
+        self.assertEqual(result['controlDiagnostic'], 'passed')
+        self.assertEqual(result['pids'], [123, 124])
+
+    def test_control_source_changes_only_documented_css_option(self):
+        snippet = '// synthetic source\nconst app = ' + runner.MOUNT
+        with patch.object(original, 'SNIPPET', original.sha(snippet.encode())):
+            controlled = runner.control_source(snippet)
+            self.assertEqual(controlled.replace('css: css + ' + json.dumps(runner.CSS), 'css'), snippet)
+            with self.assertRaisesRegex(RuntimeError, 'immutable'): runner.control_source(snippet + '// drift')
+
+    def test_wrong_result_missing_case_reused_pid_and_owned_failure_reject(self):
+        self.child('original'); self.child('control', pid=124)
+        original.save(self.out / 'control', 'result', {'case': 'original', 'status': 'passed'})
+        with self.assertRaisesRegex(RuntimeError, 'mislabeled'): runner.summarize(self.out)
+        self.child('control')
+        with self.assertRaisesRegex(RuntimeError, 'PID'): runner.summarize(self.out)
+        for field, value in [('leaked', [125]), ('survivors', [125]), ('cleanupError', 'failure')]:
+            self.child('control', pid=124)
+            child = json.loads((self.out / 'control/native-readme.json').read_text()); child[field] = value
+            original.save(self.out / 'control', 'native-readme', child)
+            with self.assertRaisesRegex(RuntimeError, 'owned'): runner.summarize(self.out)
+        for field, value in [('exit', 17), ('status', 'command-failed'), ('pid', 0)]:
+            self.child('control', pid=124)
+            child = json.loads((self.out / 'control/native-readme.json').read_text()); child[field] = value
+            original.save(self.out / 'control', 'native-readme', child)
+            with self.assertRaisesRegex(RuntimeError, 'native exit'): runner.summarize(self.out)
+        self.child('control', pid=124); (self.out / 'control/native-readme.json').unlink()
+        with self.assertRaisesRegex(RuntimeError, 'missing native'): runner.summarize(self.out)
+        (self.out / 'control/result.json').unlink()
+        with self.assertRaises(FileNotFoundError): runner.summarize(self.out)
+
+    def test_suite_retains_original_error_exit_and_independent_control_artifacts(self):
+        def run(_root, destination, case):
+            self.child(case, 'failed' if case == 'original' else 'passed', 123 if case == 'original' else 124)
+            (destination / 'count-0.png').write_bytes((case + ' synthetic artifact').encode())
+            if case == 'original': raise RuntimeError('unchanged original failure')
+        with patch.object(original, 'run', side_effect=run):
+            with self.assertRaisesRegex(RuntimeError, 'no original acceptance'): runner.run(self.out, self.out)
+        result = json.loads((self.out / 'result.json').read_text())
+        self.assertEqual(result['originalAcceptance'], 'failed')
+        self.assertEqual(result['cases']['original']['error'], 'original guard')
+        self.assertEqual(json.loads((self.out / 'original/native-readme.json').read_text())['exit'], 1)
+        self.assertNotEqual((self.out / 'original/count-0.png').read_bytes(), (self.out / 'control/count-0.png').read_bytes())
+        manifest = json.loads((self.out / 'manifest.json').read_text())
+        self.assertIn('original/count-0.png', manifest); self.assertIn('control/count-0.png', manifest)
+
+    def test_interruption_and_identity_or_cleanup_failure_stop_before_another_case(self):
+        for kind in ['interrupt', 'identity', 'owned']:
+            calls = []
+            def run(_root, destination, case):
+                calls.append(case); self.child(case, 'failed')
+                if kind == 'identity': original.save(destination, 'result', {'case': case, 'status': 'failed', 'sourceError': 'drift'})
+                if kind == 'owned': original.save(destination, 'native-readme', {'leaked': [999], 'survivors': [], 'cleanupError': None})
+                if kind == 'interrupt': raise InterruptedError('original interrupt')
+                raise RuntimeError('original failure')
+            with patch.object(original, 'run', side_effect=run):
+                with self.assertRaises((RuntimeError, InterruptedError)): runner.run(self.out, self.out)
+            self.assertEqual(calls, ['original'])
+
+    def test_probe_drift_and_disappearance_preserve_original_native_error(self):
+        # Real runner finally/hash/manifest path, mocked commands and validation.
+        # The temporary helper bytes are never an executable/native application.
+        for disappear in [False, True]:
+            out = self.out / ('missing' if disappear else 'drift')
+            pins = {'packages': {n: {'name': n, 'version': v} for n, v in original.PINS.items()}, 'binary': {'sha256': 'mock'}}
+            def command(argv, _cwd, _env, destination, name, timeout):
+                if name == 'node-version': return 'v22.22.3'
+                if name == 'bun-version': return '1.3.9'
+                if name == 'compile-frame-probe': Path(argv[-1]).write_bytes(b'mock probe, never executed')
+                if name == 'native-readme':
+                    self.assertEqual(timeout, 45)
+                    probe = destination / 'macos-frame'
+                    if disappear: probe.unlink()
+                    else: probe.write_bytes(b'changed')
+                    original.save(destination, 'native-readme', {'status': 'command-failed', 'exit': 17})
+                    raise RuntimeError('original native exit17')
+                return ''
+            with patch.object(original.platform, 'system', return_value='Darwin'), patch.object(original.platform, 'machine', return_value='arm64'), patch.object(original, 'source', return_value=({}, '// mocked snippet')), patch.object(original, 'driver_source', return_value={}), patch.object(original, 'dependency_identity', return_value=pins), patch.object(original, 'command', side_effect=command), patch.object(runner, 'control_source', return_value='// separate mocked control'):
+                with self.assertRaisesRegex(RuntimeError, 'original native exit17'): original.run(self.out, out, 'control')
+            result = json.loads((out / 'result.json').read_text())
+            self.assertEqual(result['status'], 'failed')
+            self.assertIn('probeError', result)
+            self.assertIn('original native exit17', result['error'])
+            self.assertEqual(json.loads((out / 'native-readme.json').read_text())['exit'], 17)
+            self.assertTrue((out / 'manifest.json').exists())
+
+
+class ControlReceipt(unittest.TestCase):
+    # Inherit the original meaningful acceptance negatives unchanged, and add
+    # independently labeled contrast receipts on their synthetic PNG controls.
+    def setUp(self):
+        fixtures.Acceptance.setUp(self)
+        self.contexts = []
+        self.shots = []
+        for count, row in enumerate([self.rows[1], self.rows[3]]):
+            row['window'] = {'width': 800, 'height': 600}
+            styles = [{'selector': s, 'id': i+1, 'color': '#000000', 'background': '#ffffff' if s in ('body', '.app') else '', 'text': f'Count: {count}' if s == 'p' else '+1' if s == 'button' else '', 'ancestors': []} for i, s in enumerate(['html', 'body', '.app', 'p', 'button'])]
+            regions = [{'label': label, 'id': i+1, 'bounds': {'x': 10, 'y': 10+30*i, 'width': 100, 'height': 20}} for i, label in enumerate(['app', f'Count: {count}', '+1'])]
+            context = {'pid': 123, 'count': count, 'at': 100, 'frames': 4+count*4, 'window': row['window'], 'probe': {'pid': 123, 'windowId': 5, 'scale': 1}, 'styles': styles, 'regions': regions}
+            shot = {'pid': 123, 'count': count, 'scale': 1, 'width': 800, 'height': 600, 'pngSHA256': original.sha((self.out / f'count-{count}.png').read_bytes()), 'samples': [{**r, 'device': {'left': 10, 'top': 10+30*i, 'right': 110, 'bottom': 30+30*i}, 'white': 1500, 'dark': 50, 'area': 2000, 'inkSHA256': str(count if i == 1 else 0)*64} for i, r in enumerate(regions)]}
+            self.contexts.append(context); self.shots.append(shot)
+        original.save(self.out, 'initial-styles', {'case': 'control', 'pid': 123, 'styles': self.contexts[0]['styles']})
+
+    def tearDown(self):
+        fixtures.Acceptance.tearDown(self)
+
+    def contrast_validate(self, contexts=None, shots=None):
+        original.save(self.out, 'observations', self.rows)
+        for count, (context, shot) in enumerate(zip(contexts or self.contexts, shots or self.shots)):
+            original.save(self.out, f'count-{count}-contrast-before', context)
+            original.save(self.out, f'count-{count}-contrast-after', context)
+            original.save(self.out, f'count-{count}-contrast-pixels', shot)
+        runner.validate_control(self.out)
+
+    def test_positive_contrast_receipt(self): self.contrast_validate()
+
+    def test_missing_wrong_style_scene_scale_region_foreground_or_stale_pixels_reject(self):
+        for mutate in [lambda c, s: c[0]['styles'].clear(), lambda c, s: c[0]['styles'][1].update(background=''), lambda c, s: c[0]['styles'][3].update(text='wrong'), lambda c, s: s[0].update(scale=2), lambda c, s: c[0]['probe'].update(pid=999), lambda c, s: c[0].update(frames=0), lambda c, s: s[0]['samples'].clear(), lambda c, s: s[0]['samples'][1].update(dark=0), lambda c, s: s[0]['samples'][1].update(white=0), lambda c, s: s[1]['samples'][1].update(inkSHA256=s[0]['samples'][1]['inkSHA256'])]:
+            c, s = copy.deepcopy(self.contexts), copy.deepcopy(self.shots); mutate(c, s)
+            with self.assertRaises((RuntimeError, KeyError, IndexError)): self.contrast_validate(c, s)
+        self.contrast_validate(); (self.out / 'count-1-contrast-pixels.json').unlink()
+        with self.assertRaises(FileNotFoundError): runner.validate_control(self.out)
+
+
+if __name__ == '__main__': unittest.main()

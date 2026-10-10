@@ -1,0 +1,84 @@
+name: Hosted README contrast diagnostics
+
+# Preparation cannot launch a run. Coordinator releases one reviewed push.
+on:
+  push:
+    branches: [julia/hosted-readme-contrast-qualification]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hosted-readme-contrast-qualification
+  cancel-in-progress: false
+
+jobs:
+  pr77:
+    if: ${{ github.repository == 'julia-script/foldkit-native' && github.ref == 'refs/heads/julia/hosted-readme-contrast-qualification' }}
+    runs-on: macos-15
+    timeout-minutes: 12
+    env:
+      EVIDENCE_NAME: pr77-c4e4ced134f327c143d50dea3c03774fa28738d0
+    steps:
+      - name: Establish failure evidence before checkout or setup
+        run: |
+          export EVIDENCE="$RUNNER_TEMP/$EVIDENCE_NAME"
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import json, os, platform
+          from pathlib import Path
+          out = Path(os.environ['EVIDENCE'])
+          (out / 'workflow.json').write_text(json.dumps({
+              'driver': os.environ['GITHUB_SHA'], 'target': 'c4e4ced134f327c143d50dea3c03774fa28738d0',
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+              'system': platform.platform(), 'machine': platform.machine(), 'status': 'not-run'
+          }, indent=2))
+          PY
+          sw_vers > "$EVIDENCE/macos.log"
+          system_profiler SPDisplaysDataType > "$EVIDENCE/displays.log"
+      - name: Checkout reviewed runner
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.sha }}
+          path: qualification
+          persist-credentials: false
+      - name: Checkout immutable PR77
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: c4e4ced134f327c143d50dea3c03774fa28738d0
+          path: target
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+      - name: Qualify exact README startup, native click and owned close
+        run: python3 qualification/scripts/readme-qualification/contrast_run.py "$GITHUB_WORKSPACE/target" "$RUNNER_TEMP/$EVIDENCE_NAME"
+      - name: Preserve honest workflow outcome even if startup never ran
+        if: always()
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          export EVIDENCE="$RUNNER_TEMP/$EVIDENCE_NAME"
+          mkdir -p "$EVIDENCE"
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          out = Path(os.environ['EVIDENCE'])
+          (out / 'workflow-outcome.json').write_text(json.dumps({
+              'jobStatus': os.environ['JOB_STATUS'], 'driver': os.environ['GITHUB_SHA'],
+              'run': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT']
+          }, indent=2))
+          if not (out / 'result.json').exists():
+              (out / 'result.json').write_text(json.dumps({'status': 'failed', 'phase': 'before-supervisor', 'error': 'checkout/setup/launch did not reach supervisor'}))
+          PY
+      - name: Upload unique source, raw results, pixels and cleanup evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: native-readme-contrast-pr77-c4e4ced134f327c143d50dea3c03774fa28738d0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pr77-c4e4ced134f327c143d50dea3c03774fa28738d0/
+          if-no-files-found: error
+          retention-days: 7

@@ -127,7 +127,7 @@ def driver_source():
     head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
     clean = subprocess.check_output(['git', 'status', '--porcelain'], cwd=root, text=True)
     require(not clean and head == os.environ.get('GITHUB_SHA'), 'runner is not the clean reviewed event head')
-    files = [root / '.github/workflows/hosted-readme-qualification.yml', *HERE.glob('*.py'), *HERE.glob('*.ts')]
+    files = [root / '.github/workflows/hosted-readme-qualification.yml', root / '.github/workflows/hosted-readme-contrast-qualification.yml', *HERE.glob('*.py'), *HERE.glob('*.ts'), *HERE.glob('*.swift')]
     return {'head': head, 'clean': clean, 'files': {str(path.relative_to(root)): sha(path.read_bytes()) for path in files}}
 
 
@@ -173,14 +173,17 @@ def validate(out):
             not child['leaked'] and not child['survivors'] and child['cleanupError'] is None, 'child exit/owned cleanup failed')
 
 
-def run(root, out):
+def run(root, out, case='original'):
     out.mkdir(parents=True, exist_ok=True)  # Before every preflight or launch failure.
     result = {'status': 'failed', 'phase': 'preflight', 'head': HEAD, 'started': time.time(),
-              'host': {'system': platform.system(), 'machine': platform.machine()}, 'error': None}
+              'host': {'system': platform.system(), 'machine': platform.machine()}, 'error': None, 'case': case}
     driver = None
     dependencies = None
+    probe = None
+    probe_identity = None
     save(out, 'result', result)
     try:
+        require(case in ('original', 'control'), 'unknown qualification case')
         require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'requires real macOS Apple silicon host')
         require('FOLDKIT_NATIVE_NO_WINDOW' not in os.environ, 'headless mode forbidden')
         require('NAPI_RS_NATIVE_LIBRARY_PATH' not in os.environ, 'alternate native binding forbidden')
@@ -189,7 +192,7 @@ def run(root, out):
         before, snippet = source(root)
         save(out, 'source-before', before)
         (out / 'original-snippet.ts').write_text(snippet)
-        env = {**os.environ, 'QUALIFICATION_TARGET': str(root), 'QUALIFICATION_EVIDENCE': str(out)}
+        env = {**os.environ, 'QUALIFICATION_TARGET': str(root), 'QUALIFICATION_EVIDENCE': str(out), 'QUALIFICATION_CASE': case}
         for key in ('BUN_PRELOAD', 'NODE_OPTIONS', 'FOLDKIT_NATIVE_AUTOMATION', 'FOLDKIT_NATIVE_RENDERER'):
             env.pop(key, None)
         result['node'] = command(['node', '--version'], root, env, out, 'node-version', 10).strip()
@@ -203,8 +206,18 @@ def run(root, out):
         require(pins == PINS and all(info['name'] == name for name, info in dependencies['packages'].items()), 'dependency pins/identities differ')
         result['pins'] = pins
         save(out, 'native-binary', dependencies['binary'])
+        if case == 'control':
+            probe = out / 'macos-frame'
+            command(['swiftc', str(HERE / 'macos-frame.swift'), '-o', str(probe)], root, env, out, 'compile-frame-probe', 60)
+            probe_identity = sha(probe.read_bytes())
+            save(out, 'frame-probe', {'sourceSHA256': sha((HERE / 'macos-frame.swift').read_bytes()), 'binarySHA256': probe_identity})
+            env['QUALIFICATION_FRAME_PROBE'] = str(probe)
+            from contrast_run import control_source
+            snippet = control_source(snippet)
+            (out / 'control-snippet.ts').write_text(snippet)
         # Eval runs from the documented repository root, using its exact tsconfig
-        # and imports. The snippet itself is preserved byte-for-byte and contiguous.
+        # and imports. Only the original case is verbatim; the independently
+        # labeled control changes the css option and saves its own source/hash.
         evaluation = f'import {{ begin as qualificationBegin }} from {json.dumps(str(HERE / "witness.ts"))};\nconst qualificationObserve = qualificationBegin();\n' + snippet + '\nawait qualificationObserve(app);\n'
         (out / 'executed-source.ts').write_text(evaluation)
         result['executedSHA256'] = sha(evaluation.encode())
@@ -212,6 +225,9 @@ def run(root, out):
         command(['bun', '--eval', evaluation], root, env, out, 'native-readme', 45)
         result['phase'] = 'acceptance'
         validate(out)
+        if case == 'control':
+            from contrast_run import validate_control
+            validate_control(out)
         result['status'] = 'passed'
     except BaseException as error:
         result['error'] = repr(error)
@@ -237,6 +253,14 @@ def run(root, out):
                 result['status'] = 'failed'
                 result['dependencyError'] = repr(error)
                 save(out, 'dependencies-after-failure', {'error': repr(error)})
+        if probe_identity is not None:
+            try:
+                after_probe = sha(probe.read_bytes())
+                save(out, 'frame-probe-after', {'binarySHA256': after_probe})
+                require(after_probe == probe_identity, 'window probe binary changed')
+            except BaseException as error:
+                result['status'] = 'failed'
+                result['probeError'] = repr(error)
         result['finished'] = time.time()
         save(out, 'result', result)
         manifest = {str(path.relative_to(out)): sha(path.read_bytes()) for path in out.rglob('*') if path.is_file() and path.name != 'manifest.json'}

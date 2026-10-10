@@ -1,8 +1,10 @@
 // Observations around the verbatim README snippet; no runtime or input replacement.
 import assert from 'node:assert/strict'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { join } from 'node:path'
 import type { mountGpuix, NativeElement } from 'foldkit-gpuix'
+import { context, measure, pixels, sameScene, styles } from './contrast.ts'
 
 type Box = { x: number; y: number; width: number; height: number }
 type Size = { width: number; height: number }
@@ -147,9 +149,25 @@ export function begin() {
       const point = hit(bounds, window)
       return { count, text, painted, tree, id, bounds, window, point, children: app!.document.body.childNodes.length, containerConnected: app!.container.isConnected, buttonConnected: buttons[0]!.isConnected, frames: renderer.getDebugFrameOverlayStats().frames }
     }
-    const capture = (name: string) => captureEvidence(out, name, phase, path => renderer.captureScreenshot(path), readPng)
+    const control = process.env['QUALIFICATION_CASE'] === 'control'
+    const capture = (name: string) => {
+      // The original capture/guard/error path stays exactly the same.
+      const count = name === 'count-0' ? 0 : 1
+      const before = control ? context(app!, renderer, count, measure(process.env['QUALIFICATION_FRAME_PROBE']!)) : undefined
+      if (before) writeDiagnostic(out, `${name}-contrast-before`, before)
+      const shot = captureEvidence(out, name, phase, path => renderer.captureScreenshot(path), readPng)
+      if (before) {
+        const after = context(app!, renderer, count, measure(process.env['QUALIFICATION_FRAME_PROBE']!))
+        writeDiagnostic(out, `${name}-contrast-after`, after)
+        sameScene(before, after)
+        const decoded = pixels(readPng(shot.path), after)
+        writeDiagnostic(out, `${name}-contrast-pixels`, { ...decoded, pngSHA256: createHash('sha256').update(readFileSync(shot.path)).digest('hex') })
+      }
+      return shot
+    }
     const initial = await wait(() => snapshot(0))
     writeDiagnostic(out, 'initial-readiness', { phase, ...initial })
+    writeDiagnostic(out, 'initial-styles', { case: process.env['QUALIFICATION_CASE'] ?? 'original', styles: styles(app) })
     assert(initial.children > 0 && initial.frames > 0 && !initial.containerConnected && initial.buttonConnected)
     renderedButton = app.document.querySelector('button')!
     record('before', { ...initial, screenshot: capture('count-0') })
