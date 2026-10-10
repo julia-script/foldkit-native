@@ -721,8 +721,10 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     if (scheduled) sync()
   }
   const drawn = () => {
+    if (detached) return
     layout.drew()
     settleScrolls()
+    if (detached) return
     watchSize()
     fitAspects()
     if (document.resizeObservers.size > 0) for (const observer of [...document.resizeObservers]) observer.deliver(host)
@@ -1564,9 +1566,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   /** Scroll offsets as GPUI last gave them (or as the host last set them). */
   const offsets = new WeakMap<NativeElement, [number, number]>()
   const readOffset = (element: NativeElement) => {
+    const id = element.nativeId
+    const known = offsets.get(element)
     const pending = pendingScrolls.get(element)
-    const read = renderer.getScrollOffset === undefined ? undefined : guard.ask('scroll', () => renderer.getScrollOffset!(element.nativeId))
-    if (read === undefined) return
+    const read = renderer.getScrollOffset === undefined ? undefined : guard.ask('scroll', () => renderer.getScrollOffset!(id))
+    // A getter may reenter dispatch or scrollTo. Its older answer must not
+    // replace the successful offset committed by that newer work.
+    if (read === undefined || detached || element.nativeId !== id || offsets.get(element) !== known) return
     const offset: [number, number] = [read?.[0] ?? 0, read?.[1] ?? 0]
     offsets.set(element, offset)
     if (pending !== undefined && pendingScrolls.get(element) === pending) pending.sampled = offset
@@ -1585,8 +1591,11 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     const [x, y] = [at + 0, down + 0]
     if (nativeType(element) === 'virtual-list') return scrollListTo(element, y)
     const [fromX, fromY] = offsets.get(element) ?? offsetOf(element)
+    const id = element.nativeId
+    const known = offsets.get(element)
     renderer.scrollTo?.(element.nativeId, x, y)
     const read = renderer.getScrollOffset === undefined ? undefined : guard.ask('scroll', () => renderer.getScrollOffset!(element.nativeId))
+    if (detached || element.nativeId !== id || offsets.get(element) !== known) return
     const to: [number, number] = read === undefined || read === null ? [x, y] : [read[0] ?? 0, read[1] ?? 0]
     offsets.set(element, to)
     announced.set(element, to)

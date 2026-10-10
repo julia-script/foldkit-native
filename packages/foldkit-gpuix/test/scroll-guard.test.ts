@@ -233,6 +233,7 @@ test('a read that reenters native dispatch cannot overwrite the newer notificati
   let reenter = true
   s.mounted.fake.renderer.getScrollOffset = function (...args) {
     const value = Reflect.apply(getter, this, args)
+    s.advance(8)
     if (args[0] === s.inner.nativeId && reenter) {
       reenter = false
       s.mounted.gpui.setScrollOffset(s.inner.nativeId, 0, -200)
@@ -241,10 +242,77 @@ test('a read that reenters native dispatch cannot overwrite the newer notificati
     return value
   }
   s.mounted.gpui.setScrollOffset(s.inner.nativeId, 0, -100)
-  s.wheel(); s.draw()
-  expect(s.positions.get(s.inner)).toEqual([200])
   s.wheel()
   expect(s.positions.get(s.inner)).toEqual([200])
+  expect(s.inner.scrollTop).toBe(200) // The slow outer read still holds the guard.
+  s.draw()
+  s.wheel()
+  expect(s.positions.get(s.inner)).toEqual([200])
+})
+
+test('a reentrant programmatic scroll survives the older native read returning', async () => {
+  const s = await scene(false)
+  const getter = s.mounted.fake.renderer.getScrollOffset!
+  let reenter = true
+  s.mounted.fake.renderer.getScrollOffset = function (...args) {
+    const value = Reflect.apply(getter, this, args)
+    s.advance(8)
+    if (args[0] === s.inner.nativeId && reenter) {
+      reenter = false
+      s.inner.scrollTop = 200
+    }
+    return value
+  }
+  s.mounted.gpui.setScrollOffset(s.inner.nativeId, 0, -100)
+  s.wheel()
+  expect(s.inner.scrollTop).toBe(200)
+  expect(s.positions.get(s.inner)).toEqual([])
+})
+
+test('a newer scroll during a programmatic native read keeps its cache and announcement', async () => {
+  const s = await scene(false)
+  const getter = s.mounted.fake.renderer.getScrollOffset!
+  let reenter = true
+  s.mounted.fake.renderer.getScrollOffset = function (...args) {
+    const value = Reflect.apply(getter, this, args)
+    s.advance(8)
+    if (args[0] === s.inner.nativeId && reenter) {
+      reenter = false
+      s.inner.scrollTop = 200
+    }
+    return value
+  }
+  s.inner.scrollTo({ left: 0, top: 100 })
+  expect(s.inner.scrollTop).toBe(200)
+  s.wheel()
+  expect(s.positions.get(s.inner)).toEqual([])
+})
+
+test('a deferred scroll listener closing the host ends draw work before further native reads', async () => {
+  const s = await scene(false)
+  let closed = false
+  let readsAfterClose = 0
+  const size = s.mounted.fake.renderer.getWindowSize!
+  const getter = s.mounted.fake.renderer.getScrollOffset!
+  s.mounted.fake.renderer.getWindowSize = function () {
+    if (closed) readsAfterClose++
+    return size.call(this)
+  }
+  s.mounted.fake.renderer.getScrollOffset = function (...args) {
+    if (closed) readsAfterClose++
+    return Reflect.apply(getter, this, args)
+  }
+  s.cost(8); s.hold()
+  s.mounted.gpui.setScrollOffset(s.inner.nativeId, 0, -150)
+  s.wheel()
+  expect(s.positions.get(s.inner)).toEqual([])
+  s.inner.addEventListener('scroll', () => { s.mounted.close(); closed = true })
+  s.draw(30)
+  expect(closed).toBe(true)
+  expect(s.mounted.gpui.retainedCount()).toBe(0)
+  expect(readsAfterClose).toBe(0)
+  s.draw(30)
+  expect(readsAfterClose).toBe(0)
 })
 
 test('a failed batch retains pending notifications and propagates the same error until an owned retry', async () => {
