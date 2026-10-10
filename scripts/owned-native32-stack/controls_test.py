@@ -254,6 +254,8 @@ class Controls(unittest.TestCase):
                            ('missing', map_raw.split('\n')[0] + '\n'),
                            ('base', map_raw.replace('00001000', '00001100')),
                            ('reversed', map_raw.replace('00001800', '00000001')),
+                           ('text-overrun', map_raw.replace('00001800', '00009000')),
+                           ('endpoint-ambiguity', map_raw.replace('00001800', '00002001')),
                            ('writable', map_raw.replace('r-x/rwx', 'rwx/rwx')),
                            ('nonexecute', map_raw.replace('r-x/rwx', 'r--/rwx')),
                            ('nonfile', map_raw.replace('SM=COW', 'SM=NUL'))]:
@@ -268,6 +270,7 @@ class Controls(unittest.TestCase):
         variants.append(('hash', mapper, sample, map_raw, raw, {**BINARY, 'sha256': '0' * 64}))
         variants.append(('ambiguous-image', mapper, sample, map_raw, raw + raw.split('Binary Images:\n')[1], BINARY))
         variants.append(('malformed-extra-image', mapper, sample, map_raw, raw + 'MALFORMED gpuix-native.darwin-arm64.node\n', BINARY))
+        variants.append(('truncated-image', mapper, sample, map_raw, raw.replace('0x2000', '0x1001'), BINARY))
         rejected = {}
         for name, packet, sampling, mapped, report_raw, binary in variants:
             with self.subTest(name=name), self.assertRaises(RuntimeError) as failure:

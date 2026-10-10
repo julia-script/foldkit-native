@@ -361,7 +361,14 @@ def validate_mapping(raw, mapper, original, sampler, binary, image):
             and 0 <= monotonic[2] - monotonic[1] <= MAPPER_SECONDS, 'mapper interval/order/cap differs')
     region = mapped_text(raw, pid, binary)
     require(image['start'] < image['end'] and region['start'] == image['start'], 'mapped __TEXT/sample image load base differs')
+    # Compare the reported numeric bounds conservatively. vmmap documents a
+    # region's start/end; this bridge does not infer either tool's endpoint
+    # inclusivity or normalize with +/-1. Reject a text end above the sample's
+    # displayed upper address, including a possibly ambiguous one-byte edge.
+    require(region['end'] <= image['end'], 'mapped __TEXT extends beyond reported sample image')
     return {'region': region, 'mapperIdentity': mapper['identity'], 'targetIdentity': sampler['targetIdentity'],
+            'reportedImage': image,
+            'rangeRelation': 'Same reported start; positive text end <= reported image upper address, no endpoint normalization or end equality requirement.',
             'interval': [mapper['start'], mapper['end']],
             'limits': 'Point-in-time mapping, not uninterrupted residency or in-memory bytes; __TEXT end is not whole-image end.'}
 
