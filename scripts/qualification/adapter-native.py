@@ -63,11 +63,25 @@ def command(argv, cwd, env, out, name, timeout, grace=3):
         seen = {child.pid: {"pid": child.pid, "ppid": os.getpid(), "args": " ".join(map(str, argv))}}
         timed_out = False
         interrupted = None
+        inspection_failure = None
+        def inspect():
+            nonlocal inspection_failure
+            if inspection_failure is not None:
+                return []
+            try:
+                members = group_members(child.pid)
+                for member in members:
+                    seen[member["pid"]] = member
+                return members
+            except Exception as error:
+                inspection_failure = str(error)
+                return []
         try:
             deadline = time.monotonic() + timeout
             while child.poll() is None:
-                for member in group_members(child.pid):
-                    seen[member["pid"]] = member
+                inspect()
+                if inspection_failure is not None:
+                    break
                 if time.monotonic() >= deadline:
                     timed_out = True
                     break
@@ -76,26 +90,27 @@ def command(argv, cwd, env, out, name, timeout, grace=3):
             interrupted = error
         finally:
             deadline = time.monotonic() + grace
-            while not timed_out and interrupted is None and group_members(child.pid) and time.monotonic() < deadline:
+            while not timed_out and interrupted is None and inspect() and time.monotonic() < deadline:
                 time.sleep(0.1)
-            remaining = group_members(child.pid)
-            if remaining:
+            remaining = inspect()
+            if remaining or inspection_failure is not None:
                 signal_group(child.pid, signal.SIGTERM)
                 try:
                     child.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     pass
                 deadline = time.monotonic() + 2
-                while group_members(child.pid) and time.monotonic() < deadline:
+                while inspect() and time.monotonic() < deadline:
                     time.sleep(0.1)
-                if group_members(child.pid):
+                if inspect() or inspection_failure is not None:
                     signal_group(child.pid, signal.SIGKILL)
             child.wait(timeout=5)
-            survivors = group_members(child.pid)
-            status = ("interrupted" if interrupted else "timed-out" if timed_out else
+            survivors = inspect() if inspection_failure is None else None
+            status = ("cleanup-unverified" if inspection_failure is not None else "interrupted" if interrupted else "timed-out" if timed_out else
                       "leaked-children" if remaining or survivors else "command-failed" if child.returncode else "passed")
             record.update(status=status, exit=child.returncode, finished=time.time(),
-                          ownedProcesses=list(seen.values()), leaked=remaining, survivors=survivors)
+                          ownedProcesses=list(seen.values()), leaked=remaining, survivors=survivors,
+                          inspectionFailure=inspection_failure)
             (out / f"{name}.json").write_text(json.dumps(record, indent=2))
         if interrupted:
             raise interrupted
