@@ -1,0 +1,87 @@
+name: Hosted native geometry diagnostic
+
+on:
+  pull_request:
+    branches: [julia/fork-ci-runners]
+    paths:
+      - scripts/hosted-native-geometry.ts
+      - .github/workflows/hosted-native-geometry.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-geometry-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  measurements:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.9
+      - run: npm ci
+      - run: bun run typecheck
+      - name: Record host and display
+        run: |
+          mkdir -p evidence/host
+          node --version > evidence/host/node.txt
+          npm --version > evidence/host/npm.txt
+          bun --revision > evidence/host/bun.txt
+          sw_vers > evidence/host/os.txt
+          git rev-parse HEAD > evidence/host/checkout.txt
+          system_profiler SPDisplaysDataType > evidence/host/display.txt
+          swift -e 'import AppKit; import Foundation; for screen in NSScreen.screens { print(["frame": NSStringFromRect(screen.frame), "visibleFrame": NSStringFromRect(screen.visibleFrame), "scale": screen.backingScaleFactor, "device": screen.deviceDescription] as [String: Any]) }' > evidence/host/work-area.txt
+      - name: Run bounded original cases and measurements
+        run: |
+          python3 - <<'PY'
+          import json, os, signal, subprocess, sys
+          from pathlib import Path
+          root = Path('evidence')
+          cases = [
+              ('original-big-list', ['bun', 'test', 'examples/big-list/native.test.ts', '--test-name-pattern', 'GPUI paints the list; typing, keys and the theme switch go through its input']),
+              ('original-cart', ['bun', 'test', 'examples/shopping-cart/native.test.ts', '--test-name-pattern', 'GPUI paints each page; clicks through its hit test fill the cart and change pages']),
+              ('original-stroke', ['bun', 'test', 'examples/pixel-art/native.test.ts', '--test-name-pattern', 'GPUI paints the editor; drags through its hit testing paint']),
+              ('original-listbox', ['bun', 'test', 'examples/pixel-art/native.test.ts', '--test-name-pattern', 'the theme Listbox shows its options, and picking one recolours the board']),
+          ]
+          for mode in ['requested', 'native']:
+              for probe in ['big-list', 'cart', 'stroke', 'listbox']:
+                  cases.append((f'{mode}-{probe}', ['bun', '-r', './test/support/dom.ts', 'scripts/hosted-native-geometry.ts', probe, mode]))
+          ledger = []
+          for name, command in cases:
+              out = root / name
+              out.mkdir(parents=True, exist_ok=True)
+              env = dict(os.environ, FOLDKIT_NATIVE_EVIDENCE=str(out.resolve()))
+              with (out / 'raw.log').open('wb') as log:
+                  child = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                  timed_out = False
+                  try:
+                      code = child.wait(timeout=60)
+                  except subprocess.TimeoutExpired:
+                      timed_out = True
+                      os.killpg(child.pid, signal.SIGKILL)
+                      code = child.wait()
+                  # End this owned process group even if the leader exited first.
+                  try:
+                      os.killpg(child.pid, signal.SIGKILL)
+                  except ProcessLookupError:
+                      pass
+              entry = dict(name=name, command=command, exit_code=code, timed_out=timed_out, child_reaped=child.returncode is not None)
+              ledger.append(entry)
+              (root / 'status-ledger.json').write_text(json.dumps(ledger, indent=2))
+              print(json.dumps(entry), flush=True)
+          # Collect every observation, then preserve any red command as job failure.
+          sys.exit(1 if any(c['exit_code'] != 0 or c['timed_out'] for c in ledger) else 0)
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: hosted-native-geometry
+          path: evidence/
+          if-no-files-found: error
