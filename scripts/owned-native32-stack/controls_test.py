@@ -184,6 +184,8 @@ class Controls(unittest.TestCase):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     child.child.wait(timeout=.15)
                 child.observe()
+                if program == 'descendant':
+                    self.assertGreaterEqual(len(child.receipt['observedGroupMembers']), 2)
             finally:
                 receipt = child.close()
                 m.save(self.out, program + '-process', receipt)
@@ -230,6 +232,10 @@ class Controls(unittest.TestCase):
         with patch.object(m, 'table', return_value={99991: {**row(), 'start': 'different-start'}}):
             with self.assertRaisesRegex(RuntimeError, 'stale'):
                 obj.verified_live()
+        obj.known = {123: m.token({**row(123), 'pgid': 99991})}
+        with patch.object(m, 'table', return_value={99991: row(), 123: {**row(123), 'pgid': 99991, 'start': 'reused-descendant'}}):
+            with self.assertRaisesRegex(RuntimeError, 'stale owned group member'):
+                obj.observe()
 
     def test_raw_failure_pipeline_stays_failed_with_sampler_failure_and_manifest(self):
         class FakeChild:

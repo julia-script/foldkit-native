@@ -138,7 +138,9 @@ class Owned:
             # Same newly-created session/group while its known leader is live.
             for pid, member in rows.items():
                 if member['pgid'] == self.child.pid:
+                    require(pid not in self.known or self.known[pid] == token(member), 'stale owned group member identity')
                     self.known[pid] = token(member)
+            self.receipt['observedGroupMembers'] = dict(self.known)
             self.receipt['lastLive'] = stamp()
             self.receipt['lastResources'] = row
         return rows
