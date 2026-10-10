@@ -139,6 +139,62 @@ SAFE_PROGRAMS = {
     'failure': 'import time; time.sleep(.15); raise SystemExit(17)',
     'hang': 'import time; time.sleep(20)',
     'descendant': 'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"]); print("owned-descendant",flush=True); time.sleep(20)',
+    'measurement-publication': '''import os,sys,runpy,signal,subprocess
+from pathlib import Path
+out=Path(os.environ['FOLDKIT_SAFE_MEASUREMENT_OUT']).resolve()
+assert not out.is_relative_to(Path.cwd())
+point=os.environ['FOLDKIT_SAFE_PUBLICATION_POINT']
+assert point in ('result.json','manifest.json')
+original_link=os.link
+sent=False
+def link(src,dst,*args,**kwargs):
+    global sent
+    if Path(dst).name==point and not sent:
+        sent=True
+        print('self-SIGTERM before '+point,flush=True)
+        os.kill(os.getpid(),signal.SIGTERM)
+    return original_link(src,dst,*args,**kwargs)
+os.link=link
+def forbidden(*args,**kwargs):
+    raise RuntimeError('unexpected child across forbidden native boundary')
+subprocess.Popen=forbidden
+os.environ['GITHUB_ACTIONS']='false'
+sys.argv=['scripts/owned-native32-stack/measure.py','--out',str(out)]
+runpy.run_path(sys.argv[0],run_name='__main__')
+''',
+    'measurement-spawn-registration': '''import os,sys,signal,subprocess
+from pathlib import Path
+sys.path.insert(0,str(Path.cwd()/'scripts/owned-native32-stack'))
+import measure as m
+out=Path(os.environ['FOLDKIT_SAFE_MEASUREMENT_OUT']).resolve()
+assert not out.is_relative_to(m.ROOT)
+out.mkdir(exist_ok=False)
+program='import time; time.sleep(20)'
+argv=[sys.executable,'-c',program]
+m.save(out,'allowlist',{'argv':argv,'sourceSHA256':m.sha(program.encode()),'classification':'harmless registration control only'})
+m.install_measurement_cancellation()
+actual=None
+def factory(command,**kwargs):
+    global actual
+    assert command==argv
+    actual=subprocess.Popen(command,**kwargs)
+    os.kill(os.getpid(),signal.SIGTERM)
+    return actual
+try:
+    m.Owned(argv,out,'registered',dict(os.environ),factory=factory)
+    raise RuntimeError('registration interruption not delivered')
+except m.MeasurementCancelled as error:
+    receipt=__import__('json').loads((out/'registered-process.json').read_text())
+    assert error.signum==15 and actual is not None
+    assert receipt['identity']['pid']==actual.pid and receipt['rawExit']==-15
+    assert receipt['cleanupVerified'] and receipt['survivors']==[] and not m.ACTIVE_OWNED
+    rows=m.table()
+    assert not any(row['pgid']==actual.pid and not row['state'].startswith('Z') for row in rows.values())
+    m.DEFER_CANCELLATION=True
+    m.save(out,'result',{'signal':error.signum,'originalRawExit':actual.returncode,'knownLiveAfter':[],'receipt':receipt})
+    m.save(out,'manifest',{str(p.relative_to(out)):m.sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
+    raise SystemExit(143)
+''',
 }
 
 

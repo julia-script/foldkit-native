@@ -33,6 +33,33 @@ LIMITS = {'originalEnvelopeSeconds': 60, 'sampleSeconds': 25, 'sampleIntervalMil
 ACTIVE_OWNED = []
 DEFER_CANCELLATION = False
 CANCELLATION_CHECK = None
+MEASUREMENT_SIGNAL = None
+MEASUREMENT_RAISED = False
+
+
+class MeasurementCancelled(KeyboardInterrupt):
+    def __init__(self, signum):
+        self.signum = signum
+        super().__init__('measurement signal ' + str(signum))
+
+
+def check_measurement_cancellation():
+    global MEASUREMENT_RAISED
+    if MEASUREMENT_SIGNAL and not MEASUREMENT_RAISED and not DEFER_CANCELLATION:
+        MEASUREMENT_RAISED = True
+        raise MeasurementCancelled(MEASUREMENT_SIGNAL)
+
+
+def install_measurement_cancellation():
+    global CANCELLATION_CHECK
+    def interrupted(signum, _frame):
+        global MEASUREMENT_SIGNAL
+        if MEASUREMENT_SIGNAL is None:
+            MEASUREMENT_SIGNAL = signum
+        check_measurement_cancellation()
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
+    CANCELLATION_CHECK = check_measurement_cancellation
 
 
 def require(value, message):
@@ -306,6 +333,7 @@ def test_verdict(raw, receipt):
 
 
 def run(out):
+    global DEFER_CANCELLATION
     require(not out.is_relative_to(ROOT), 'evidence must be outside frozen checkout')
     out.mkdir(parents=True, exist_ok=False)
     state = {'completeEvidence': False, 'originalVerdict': 'unproved', 'originalRawExit': None,
@@ -362,48 +390,64 @@ def run(out):
     except BaseException as error:
         state['error'] = repr(error)
     finally:
-        for child in (sampler, original):
-            if child:
-                receipt = child.close()
-                save(out, child.role + '-process', receipt)
-        for role, child in (('original', original), ('sampler', sampler)):
-            failed = out / (role + '-process.json')
-            receipt = child.receipt if child else json.loads(failed.read_text()) if failed.exists() else {}
-            state[role + 'RawExit'] = receipt.get('rawExit')
+        previous = DEFER_CANCELLATION
+        DEFER_CANCELLATION = True
         try:
-            if source:
-                after = source_identity()
-                save(out, 'source-after', after)
-                require(after == source, 'source/driver identity changed')
-            if deps:
-                after = dependency_identity()
-                save(out, 'dependencies-after', after)
-                require(after == deps, 'package/native identity changed')
-            require(original and original.receipt['cleanupVerified'], 'original cleanup not proven')
-            raw = (out / 'original.stdout.log').read_text(errors='replace') + (out / 'original.stderr.log').read_text(errors='replace')
-            state['originalVerdict'] = test_verdict(raw, original.receipt)
-            require(sampler is not None, 'sample unavailable')
-            report = validate_report((out / 'sample.txt').read_text(), original.receipt, sampler.receipt, deps['binary'])
-            save(out, 'stack-evidence', report)
-            if state['originalVerdict'] == 'pass':
-                png = out / 'native/pixel-art-big-stroke.png'
-                require(png.is_file() and png.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'), 'original passing screenshot absent')
-            require(not state.get('error'), 'earlier execution failure remains')
-            state['completeEvidence'] = True
-        except BaseException as error:
-            state['evidenceError'] = repr(error)
-        state['end'] = stamp()
-        save(out, 'result', state)
-        save(out, 'manifest', {str(p.relative_to(out)): sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
+            for child in (sampler, original):
+                if child:
+                    receipt = child.close()
+                    save(out, child.role + '-process', receipt)
+            for role, child in (('original', original), ('sampler', sampler)):
+                failed = out / (role + '-process.json')
+                receipt = child.receipt if child else json.loads(failed.read_text()) if failed.exists() else {}
+                state[role + 'RawExit'] = receipt.get('rawExit')
+            try:
+                if source:
+                    after = source_identity()
+                    save(out, 'source-after', after)
+                    require(after == source, 'source/driver identity changed')
+                if deps:
+                    after = dependency_identity()
+                    save(out, 'dependencies-after', after)
+                    require(after == deps, 'package/native identity changed')
+                require(original and original.receipt['cleanupVerified'], 'original cleanup not proven')
+                raw = (out / 'original.stdout.log').read_text(errors='replace') + (out / 'original.stderr.log').read_text(errors='replace')
+                state['originalVerdict'] = test_verdict(raw, original.receipt)
+                require(sampler is not None, 'sample unavailable')
+                report = validate_report((out / 'sample.txt').read_text(), original.receipt, sampler.receipt, deps['binary'])
+                save(out, 'stack-evidence', report)
+                if state['originalVerdict'] == 'pass':
+                    png = out / 'native/pixel-art-big-stroke.png'
+                    require(png.is_file() and png.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'), 'original passing screenshot absent')
+                require(not state.get('error'), 'earlier execution failure remains')
+                state['completeEvidence'] = True
+            except BaseException as error:
+                state['evidenceError'] = repr(error)
+            state['end'] = stamp()
+            if MEASUREMENT_SIGNAL:
+                state['interruptSignal'] = MEASUREMENT_SIGNAL
+            save(out, 'result', state)
+            if MEASUREMENT_SIGNAL:
+                save(out, 'measurement-interruption', {'signal': MEASUREMENT_SIGNAL, 'observed': stamp(),
+                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'],
+                     'error': state.get('error'), 'evidenceError': state.get('evidenceError')})
+            save(out, 'manifest', {str(p.relative_to(out)): sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
+            # A signal delivered while publishing the first manifest is late:
+            # preserve that immutable snapshot and add a final inventory.
+            if MEASUREMENT_SIGNAL and not (out / 'measurement-interruption.json').exists():
+                save(out, 'measurement-interruption', {'signal': MEASUREMENT_SIGNAL, 'observed': stamp(),
+                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'],
+                     'error': state.get('error'), 'evidenceError': state.get('evidenceError')})
+                save(out, 'terminal-manifest', {str(p.relative_to(out)): sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
+        finally:
+            DEFER_CANCELLATION = previous
     raw_exit = state['originalRawExit']
-    return (raw_exit if raw_exit > 0 else 128 - raw_exit) if isinstance(raw_exit, int) and raw_exit != 0 else (0 if state['completeEvidence'] else 1)
+    return (raw_exit if raw_exit > 0 else 128 - raw_exit) if isinstance(raw_exit, int) and raw_exit != 0 else (128 + MEASUREMENT_SIGNAL if MEASUREMENT_SIGNAL else 0 if state['completeEvidence'] else 1)
 
 
 if __name__ == '__main__':
+    install_measurement_cancellation()
     parser = argparse.ArgumentParser()
     parser.add_argument('--out', type=Path, required=True)
     args = parser.parse_args()
-    def interrupted(signum, _frame):
-        raise InterruptedError('owned supervisor signal ' + str(signum))
-    signal.signal(signal.SIGTERM, interrupted)
     raise SystemExit(run(args.out.resolve()))

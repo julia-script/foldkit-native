@@ -335,6 +335,64 @@ class Controls(unittest.TestCase):
             m.save(self.out, 'closed', {'wrong': 'replacement'})
         self.assertEqual(raw, (self.out / 'closed.json').read_bytes())
 
+    def test_actual_measurement_entrypoint_deferred_publication(self):
+        self.out.mkdir()
+        for point in ('result.json', 'manifest.json'):
+            out = self.out / point.removesuffix('.json')
+            argv = [sys.executable, '-c', safe.SAFE_PROGRAMS['measurement-publication']]
+            m.save(self.out, point + '-allowlist', safe.harmless(argv))
+            env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'FOLDKIT_SAFE_MEASUREMENT_OUT': str(out),
+                   'FOLDKIT_SAFE_PUBLICATION_POINT': point}
+            child = m.Owned(argv, self.out, point + '-entrypoint', env)
+            try:
+                child.child.wait(timeout=10)
+            finally:
+                receipt = child.close()
+                m.save(self.out, point + '-entrypoint-process', receipt)
+            self.assertEqual(receipt['rawExit'], 143)
+            self.assertTrue(receipt['cleanupVerified'])
+            self.assertEqual(receipt['survivors'], [])
+            result = json.loads((out / 'result.json').read_text())
+            self.assertIn('local native execution forbidden', result['error'])
+            self.assertIsNone(result['originalRawExit'])
+            self.assertIsNone(result['samplerRawExit'])
+            self.assertFalse(result['completeEvidence'])
+            interrupt = json.loads((out / 'measurement-interruption.json').read_text())
+            self.assertEqual(interrupt['signal'], 15)
+            self.assertEqual(interrupt['error'], result['error'])
+            self.assertFalse(list(out.rglob('*.pending-*')))
+            for path in out.rglob('*.json'):
+                json.loads(path.read_text())
+            for name in ('manifest.json', 'terminal-manifest.json'):
+                path = out / name
+                if path.exists():
+                    for relative, digest in json.loads(path.read_text()).items():
+                        self.assertEqual(m.sha((out / relative).read_bytes()), digest)
+            self.assertEqual((out / 'terminal-manifest.json').exists(), point == 'manifest.json')
+
+    def test_real_measurement_handler_at_harmless_spawn_registration(self):
+        self.out.mkdir()
+        out = self.out / 'registration'
+        argv = [sys.executable, '-c', safe.SAFE_PROGRAMS['measurement-spawn-registration']]
+        m.save(self.out, 'registration-allowlist', safe.harmless(argv))
+        child = m.Owned(argv, self.out, 'registration-supervisor',
+                        {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'FOLDKIT_SAFE_MEASUREMENT_OUT': str(out)})
+        try:
+            child.child.wait(timeout=10)
+        finally:
+            receipt = child.close()
+            m.save(self.out, 'registration-supervisor-process', receipt)
+        self.assertEqual(receipt['rawExit'], 143)
+        self.assertTrue(receipt['cleanupVerified'])
+        result = json.loads((out / 'result.json').read_text())
+        self.assertEqual(result['signal'], 15)
+        self.assertEqual(result['originalRawExit'], -15)
+        self.assertEqual(result['knownLiveAfter'], [])
+        self.assertTrue(result['receipt']['cleanupVerified'])
+        self.assertEqual(result['receipt']['survivors'], [])
+        for relative, digest in json.loads((out / 'manifest.json').read_text()).items():
+            self.assertEqual(m.sha((out / relative).read_bytes()), digest)
+
     def test_raw_failure_pipeline_stays_failed_with_sampler_failure_and_manifest(self):
         class FakeChild:
             def __init__(self, argv, out, role, env):
@@ -368,7 +426,7 @@ class Controls(unittest.TestCase):
         cases = [(17, 13, 'raw-fail'), (0, 13, 'sample-fail'), (0, 0, 'missing-report'),
                  (-15, 0, 'original-timeout'), (0, -15, 'sampler-timeout'),
                  (0, -15, 'sampler-wait-timeout'), (17, None, 'early-original'),
-                 (0, 0, 'source-drift'), (0, 0, 'binary-drift')]
+                 (0, 0, 'source-drift'), (0, 0, 'binary-drift'), (17, 13, 'terminal-interrupt')]
         for original_exit, sampler_exit, mode in cases:
             out = self.out / mode
             limits = {**m.LIMITS}
@@ -385,7 +443,8 @@ class Controls(unittest.TestCase):
             with patch.dict(os.environ, {**clean_env, **release}, clear=True), patch.object(os, 'uname', return_value=type('OS', (), {'sysname': 'Darwin'})()), \
                  patch.object(m, 'source_identity', side_effect=[source, source_after]), patch.object(m, 'dependency_identity', side_effect=[deps, deps_after]), \
                  patch.object(m, 'read_command', side_effect=lambda argv: '1.3.9' if argv[0] == 'bun' else 'v22.22.3' if argv[0] == 'node' else 'synthetic nm'), \
-                 patch.object(m, 'Owned', FakeChild), patch.object(m, 'LIMITS', limits):
+                 patch.object(m, 'Owned', FakeChild), patch.object(m, 'LIMITS', limits), \
+                 patch.object(m, 'MEASUREMENT_SIGNAL', 15 if mode == 'terminal-interrupt' else None):
                 actual_exit = m.run(out)
                 self.assertEqual(actual_exit, 128 - original_exit if original_exit < 0 else original_exit or 1, (out / 'result.json').read_text())
             result = json.loads((out / 'result.json').read_text())
@@ -404,6 +463,11 @@ class Controls(unittest.TestCase):
             if mode in ('source-drift', 'binary-drift'):
                 self.assertIn('identity changed', result['evidenceError'])
             self.assertFalse(result['completeEvidence'])
+            if mode == 'terminal-interrupt':
+                self.assertEqual(result['interruptSignal'], 15)
+                interrupt = json.loads((out / 'measurement-interruption.json').read_text())
+                self.assertEqual(interrupt['originalRawExit'], 17)
+                self.assertEqual(interrupt['samplerRawExit'], 13)
             self.assertTrue((out / 'manifest.json').exists())
             self.assertEqual((out / 'original.stderr.log').read_text(), 'synthetic original error')
 
