@@ -114,10 +114,12 @@ export const qualifyRetainedPrivacy = async (
     for (const action of ['clear', 'replace', 'remove'] as const) {
       const field = makeField('596274')
       await secretControl(`${action}-initial-secret`, field, '596274')
+      // Retained content is independent of editor props.value. Supersede the
+      // controlled echo before host submission samples its retirement fence.
       if (action === 'clear') {
-        field.value = ''; app.host.flush(); echo(field, '')
+        field.value = ''; echo(field, ''); app.host.flush()
       } else if (action === 'replace') {
-        field.value = '831905'; app.host.flush(); echo(field, '831905')
+        field.value = '831905'; echo(field, '831905'); app.host.flush()
         await secretControl('replacement-current-secret', field, '831905')
       } else { field.remove(); app.host.flush() }
       await advance(`${action}-completed-frame`)
@@ -144,13 +146,13 @@ export const qualifyRetainedPrivacy = async (
     native.simulateKeystrokes('9')
     try { await until(() => inputEvents > 0 && field.value === '9', 'native input event/value') }
     catch (error) { record('native-input-failed', { inputEvents, value: field.value, frames: frames() }); throw error }
-    app.host.flush(); echo(field, '9')
+    echo(field, '9'); app.host.flush()
     await secretControl('native-input-current-secret', field, '9')
     record('native-input-event', { inputEvents, value: field.value, frames: frames() })
     // Multiple successful host submissions before the next JS await. The last
     // value must remain secret while earlier values become public after a draw.
     for (const value of ['FIRST-CAPTURE', 'SECOND-CAPTURE', 'NEWER-SECRET']) {
-      field.value = value; app.host.flush(); echo(field, value)
+      field.value = value; echo(field, value); app.host.flush()
     }
     await secretControl('rapid-current-newer-secret', field, 'NEWER-SECRET')
     const reused = app.document.createElement('div')
