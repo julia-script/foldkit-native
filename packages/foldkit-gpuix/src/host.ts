@@ -757,7 +757,10 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     }
   }
   const unmount = (node: NativeNode) => {
-    if (node instanceof NativeElement) settled(node)
+    if (node instanceof NativeElement) {
+      cancelEdit(node)
+      settled(node)
+    }
     if (node.nativeId !== 0) {
       unregisterEventHandlers(eventHandlers, node.nativeId)
       nodes.delete(node.nativeId)
@@ -988,6 +991,8 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   // for one task; if a Tab keydown came for that field around it, the change
   // is dropped and GPUI's editor gets the old value back. Otherwise (a pasted
   // tab) it goes through, a task late. FoldKit never sees the tab Tab typed.
+  // A newer native or controlled value supersedes the held change: its
+  // timer must never write an older value or emit input after the newer one.
   // Per field: Tabs GPUI queues together go to one field, then the next,
   // before the first field's change comes in.
   const tabbedAt = new WeakMap<NativeElement, number>()
@@ -997,6 +1002,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   const onlyAddsTabs = (before: string, after: string) =>
     after.length > before.length && after.replace(/\t/g, '') === before.replace(/\t/g, '')
   const typedByTab = (element: NativeElement) => performance.now() - (tabbedAt.get(element) ?? -Infinity) < 100
+  const pendingEdits = new Map<NativeElement, ReturnType<typeof setTimeout>>()
+  const cancelEdit = (element: NativeElement) => {
+    const timer = pendingEdits.get(element)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    pendingEdits.delete(element)
+  }
 
   // KEYS
   // Keys come from GPUI's window key events only (no element listens for
@@ -1158,6 +1170,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         return
       case 'change': {
         inputAt = performance.now()
+        cancelEdit(element)
         const value = unnudged(element, event.value ?? '')
         if (isSecretField(element)) {
           secrets?.capture(value)
@@ -1170,10 +1183,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         if (onlyAddsTabs(element.value, value)) {
           const before = element.value
           if (typedByTab(element)) return restoreValue(element, before)
-          setTimeout(() => {
-            if (typedByTab(element)) restoreValue(element, before)
+          const id = element.nativeId
+          pendingEdits.set(element, setTimeout(() => {
+            pendingEdits.delete(element)
+            if (detached || element.nativeId !== id || !element.isConnected) return
+            if (isLocked(element) || typedByTab(element)) restoreValue(element, before)
             else typed(element, value)
-          }, 0)
+          }, 0))
           return
         }
         typed(element, value)
@@ -1754,6 +1770,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         if (isSecretField(element)) secrets?.capture(element.value)
       }
       if (what === 'value') {
+        cancelEdit(element)
         if (element.nativeId !== 0) syncProps(element)
         schedule()
         return
@@ -1959,6 +1976,8 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     detach: (options: { windowGone?: boolean } = {}) => {
       if (detached) return
       detached = true
+      for (const timer of pendingEdits.values()) clearTimeout(timer)
+      pendingEdits.clear()
       secrets?.dispose()
       if (drawTimer !== undefined) clearTimeout(drawTimer)
       drawTimer = undefined
