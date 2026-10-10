@@ -45,6 +45,43 @@ export function disposal(mounted: boolean, containerRestored: boolean, buttonDis
   assert(hostDetached && restored && stateDetached, 'adapter resources were not released')
 }
 
+export function writeDiagnostic(out: string, name: string, values: Record<string, unknown>) {
+  writeFileSync(join(out, `${name}.json`), JSON.stringify({ pid: process.pid, at: Date.now(), ...values }, null, 2))
+}
+
+export function captureEvidence(out: string, name: string, phase: string, captureScreenshot: (path: string) => void, readPng: (path: string) => { width: number; height: number; pixel(x: number, y: number): Array<number> }) {
+  const path = join(out, `${name}.png`)
+  const diagnostic: Record<string, unknown> = { name, path, phase, stage: 'capture', status: 'started' }
+  try {
+    captureScreenshot(path)
+    diagnostic.stage = 'decode'
+    const image = readPng(path)
+    diagnostic.width = image.width
+    diagnostic.height = image.height
+    diagnostic.stage = 'dimensions-guard'
+    assert(image.width > 0 && image.height > 0)
+    diagnostic.stage = 'pixel-scan'
+    const first = image.pixel(0, 0)
+    diagnostic.first = first
+    let varied = 0
+    for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
+      if (image.pixel(x, y).some((v: number, i: number) => v !== first[i])) varied++
+    }
+    diagnostic.varied = varied
+    diagnostic.stage = 'nonuniform-guard'
+    assert(varied > 100, 'empty/uniform native screenshot')
+    diagnostic.status = 'passed'
+    writeDiagnostic(out, `${name}-capture`, diagnostic)
+    return { path, width: image.width, height: image.height, varied }
+  } catch (error) {
+    diagnostic.status = 'failed'
+    diagnostic.error = error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : { message: String(error) }
+    // Artifact writing must not replace the original capture/decode/guard error.
+    try { writeDiagnostic(out, `${name}-capture`, diagnostic) } catch {}
+    throw error
+  }
+}
+
 export function begin() {
   const out = process.env['QUALIFICATION_EVIDENCE']!
   const root = process.env['QUALIFICATION_TARGET']!
@@ -110,20 +147,9 @@ export function begin() {
       const point = hit(bounds, window)
       return { count, text, painted, tree, id, bounds, window, point, children: app!.document.body.childNodes.length, containerConnected: app!.container.isConnected, buttonConnected: buttons[0]!.isConnected, frames: renderer.getDebugFrameOverlayStats().frames }
     }
-    const capture = (name: string) => {
-      const path = join(out, `${name}.png`)
-      renderer.captureScreenshot(path)
-      const image = readPng(path)
-      assert(image.width > 0 && image.height > 0)
-      const first = image.pixel(0, 0)
-      let varied = 0
-      for (let y = 0; y < image.height; y++) for (let x = 0; x < image.width; x++) {
-        if (image.pixel(x, y).some((v: number, i: number) => v !== first[i])) varied++
-      }
-      assert(varied > 100, 'empty/uniform native screenshot')
-      return { path, width: image.width, height: image.height, varied }
-    }
+    const capture = (name: string) => captureEvidence(out, name, phase, path => renderer.captureScreenshot(path), readPng)
     const initial = await wait(() => snapshot(0))
+    writeDiagnostic(out, 'initial-readiness', { phase, ...initial })
     assert(initial.children > 0 && initial.frames > 0 && !initial.containerConnected && initial.buttonConnected)
     renderedButton = app.document.querySelector('button')!
     record('before', { ...initial, screenshot: capture('count-0') })
