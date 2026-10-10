@@ -7,9 +7,12 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+import run as qualification
 
 
 class Startup(unittest.TestCase):
+    entrypoints = ('run.py', 'contrast_run.py', 'corrected_run.py')
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
@@ -67,7 +70,7 @@ else:
                               cwd=self.root, env=self.env, text=True, capture_output=True, timeout=10)
 
     def test_real_owned_entrypoint_imports_stay_clean_without_startup_flags(self):
-        for entrypoint in ('run.py', 'contrast_run.py'):
+        for entrypoint in self.entrypoints:
             with self.subTest(entrypoint=entrypoint):
                 out = self.base / entrypoint
                 child = self.probe(entrypoint, out)
@@ -93,8 +96,9 @@ else:
                 ns['driver_source'](blocked, 'before')
 
     def test_full_dirty_and_wrong_head_state_rejects_without_waiver(self):
-        for defect in ('tracked', 'untracked', 'wrong-head'):
-            root = self.checkout(defect, self.head)
+        for entrypoint, defect in ((entrypoint, defect) for entrypoint in self.entrypoints
+                                  for defect in ('tracked', 'untracked', 'wrong-head')):
+            root = self.checkout(entrypoint + '-' + defect, self.head)
             self.root = root
             if defect == 'tracked':
                 (root / 'scripts/readme-qualification/witness.ts').write_text('deliberate tracked drift')
@@ -105,9 +109,9 @@ else:
                 (extra / 'b.txt').write_text('second untracked file')
             else:
                 self.env['GITHUB_SHA'] = 'f' * 40
-            out = self.base / ('evidence-' + defect)
-            child = self.probe('contrast_run.py', out)
-            with self.subTest(defect=defect):
+            out = self.base / ('evidence-' + entrypoint + '-' + defect)
+            child = self.probe(entrypoint, out)
+            with self.subTest(entrypoint=entrypoint, defect=defect):
                 self.assertEqual(child.returncode, 1)
                 self.assertIn('runner is not the clean reviewed event head', child.stderr)
                 state = json.loads((out / 'driver-state-probe.json').read_text())
@@ -121,8 +125,8 @@ else:
             self.env['GITHUB_SHA'] = self.head
 
     def test_real_entrypoint_pipeline_retains_early_state_error_raw_exit_and_manifest(self):
-        target = self.checkout('target', 'c4e4ced134f327c143d50dea3c03774fa28738d0')
-        for entrypoint in ('run.py', 'contrast_run.py'):
+        target = self.checkout('target', qualification.HEAD)
+        for entrypoint in self.entrypoints:
             self.env['GITHUB_SHA'] = 'f' * 40
             out = self.base / ('failed-' + entrypoint)
             child = self.probe(entrypoint, out, main=True, target=target)
@@ -131,7 +135,7 @@ else:
                 self.assertEqual(child.returncode, 1)
                 self.assertIn('runner is not the clean reviewed event head', child.stderr)
                 result = json.loads((case / 'result.json').read_text())
-                self.assertEqual(result['case'], 'original')
+                self.assertEqual(result['case'], 'corrected' if entrypoint == 'corrected_run.py' else 'original')
                 self.assertEqual(result['status'], 'failed')
                 self.assertIn('runner is not the clean reviewed event head', result['error'])
                 for phase in ('before', 'after'):
@@ -146,8 +150,8 @@ else:
                 self.assertFalse((case / 'native-readme.json').exists())
 
     def test_real_clean_pipeline_reaches_only_safe_runtime_boundary(self):
-        target = self.checkout('target', 'c4e4ced134f327c143d50dea3c03774fa28738d0')
-        for entrypoint in ('run.py', 'contrast_run.py'):
+        target = self.checkout('target', qualification.HEAD)
+        for entrypoint in self.entrypoints:
             out = self.base / ('clean-' + entrypoint)
             child = self.probe(entrypoint, out, main=True, target=target)
             case = out / 'original' if entrypoint == 'contrast_run.py' else out
@@ -155,6 +159,7 @@ else:
                 self.assertEqual(child.returncode, 1)
                 self.assertIn('safe boundary before any runtime/native command', child.stderr)
                 result = json.loads((case / 'result.json').read_text())
+                self.assertEqual(result['case'], 'corrected' if entrypoint == 'corrected_run.py' else 'original')
                 self.assertNotIn('sourceError', result)
                 self.assertIn('safe boundary', result['error'])
                 before = json.loads((case / 'driver-before.json').read_text())
@@ -163,6 +168,57 @@ else:
                 command = json.loads((case / 'node-version.json').read_text())
                 self.assertEqual(command['status'], 'spawn-failed')
                 self.assertNotIn('pid', command)
+                self.assertFalse((case / 'native-readme.json').exists())
+                self.assertFalse((out / 'control').exists())
+                self.assertEqual(list(self.root.rglob('*.pyc')), [])
+
+    def test_corrected_dirty_pipeline_retains_exact_porcelain_raw_exit_and_artifacts(self):
+        target = self.checkout('target', qualification.HEAD)
+        for defect in ('tracked', 'untracked'):
+            self.root = self.checkout('corrected-dirty-' + defect, self.head)
+            if defect == 'tracked':
+                (self.root / 'scripts/readme-qualification/witness.ts').write_text('deliberate tracked drift')
+            else:
+                (self.root / 'unexpected.txt').write_text('deliberate untracked drift')
+            out = self.base / ('corrected-dirty-evidence-' + defect)
+            child = self.probe('corrected_run.py', out, main=True, target=target)
+            with self.subTest(defect=defect):
+                self.assertEqual(child.returncode, 1)
+                self.assertIn('runner is not the clean reviewed event head', child.stderr)
+                result = json.loads((out / 'result.json').read_text())
+                self.assertEqual(result['case'], 'corrected')
+                self.assertEqual(result['status'], 'failed')
+                self.assertIn('runner is not the clean reviewed event head', result['error'])
+                manifest = json.loads((out / 'manifest.json').read_text())
+                for phase in ('before', 'after'):
+                    state = json.loads((out / f'driver-state-{phase}.json').read_text())
+                    self.assertEqual(state['head'], self.head)
+                    self.assertEqual(state['expectedGITHUB_SHA'], self.head)
+                    self.assertEqual(state['clean'], self.git(self.root, 'status', '--porcelain', '--untracked-files=all'))
+                    self.assertTrue(state['bytecodeDisabled'])
+                    self.assertIn(f'driver-state-{phase}.json', manifest)
+                self.assertFalse((out / 'node-version.json').exists())
+                self.assertFalse((out / 'native-readme.json').exists())
+                self.assertEqual(list(self.root.rglob('*.pyc')), [])
+
+    def test_old_uncorrected_target_is_rejected_before_runtime_with_error_and_manifest(self):
+        target = self.checkout('old-target', 'c4e4ced134f327c143d50dea3c03774fa28738d0')
+        for entrypoint in self.entrypoints:
+            out = self.base / ('old-source-' + entrypoint)
+            child = self.probe(entrypoint, out, main=True, target=target)
+            case = out / 'original' if entrypoint == 'contrast_run.py' else out
+            with self.subTest(entrypoint=entrypoint):
+                self.assertEqual(child.returncode, 1)
+                self.assertIn('immutable source drift', child.stderr)
+                result = json.loads((case / 'result.json').read_text())
+                self.assertEqual(result['case'], 'corrected' if entrypoint == 'corrected_run.py' else 'original')
+                self.assertEqual(result['status'], 'failed')
+                self.assertIn('immutable source drift', result['error'])
+                self.assertIn('immutable source drift', result['sourceError'])
+                manifest = json.loads((case / 'manifest.json').read_text())
+                self.assertIn('result.json', manifest)
+                self.assertIn('driver-state-before.json', manifest)
+                self.assertFalse((case / 'node-version.json').exists())
                 self.assertFalse((case / 'native-readme.json').exists())
                 self.assertFalse((out / 'control').exists())
                 self.assertEqual(list(self.root.rglob('*.pyc')), [])
