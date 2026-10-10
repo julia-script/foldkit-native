@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 sys.dont_write_bytecode = True
 from run import supervise
 from validate import TITLE, validate
@@ -72,6 +73,16 @@ class Controls(unittest.TestCase):
             self.assertTrue(result["reaped"])
             self.assertIn("SIGKILL", result["signals"])
             self.assertNotEqual(result["returncode"], 0)
+
+    def test_zombie_only_permission_race_is_accepted_but_live_denial_fails(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch("run.os.killpg", side_effect=PermissionError), patch("run.group_members", return_value=[]):
+                result = supervise([sys.executable, "-c", "pass"], Path(folder) / "raw", os.environ)
+                self.assertTrue(result["groupClean"])
+                self.assertIn("group-has-no-live-members", result["signals"])
+            with patch("run.os.killpg", side_effect=PermissionError), patch("run.group_members", return_value=[123]):
+                with self.assertRaises(PermissionError):
+                    supervise([sys.executable, "-c", "pass"], Path(folder) / "raw2", os.environ)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,13 @@ def supervise(command, raw_path, env, deadline=60):
                 signals.append(signal.Signals(sig).name)
             except ProcessLookupError:
                 pass  # Owned group already exited: the expected cleanup race.
+            except PermissionError:
+                # macOS can retain an orphaned zombie group under launchd:
+                # signalling it yields EPERM rather than ESRCH. Only accept
+                # that race after proving there are NO live owned members.
+                if group_members(child.pid):
+                    raise
+                signals.append("group-has-no-live-members")
         try:
             try:
                 child.wait(timeout=deadline)
