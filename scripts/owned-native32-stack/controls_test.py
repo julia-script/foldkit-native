@@ -237,6 +237,31 @@ class Controls(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'stale owned group member'):
                 obj.observe()
 
+    def test_nested_cleanup_refuses_reused_pid_and_unknown_inspection(self):
+        known = {123: m.token(row(123))}
+        with patch.object(m, 'table', return_value={123: {**row(123), 'start': 'reused'}}), patch.object(os, 'kill') as kill:
+            receipt = safe.cleanup_nested(known)
+            kill.assert_not_called()
+            self.assertFalse(receipt['cleanupVerified'])
+            self.assertIsNone(receipt['survivors'])
+            self.assertIn('signal refused', receipt['error'])
+        with patch.object(m, 'table', side_effect=OSError('inspection unavailable')), patch.object(os, 'kill') as kill:
+            receipt = safe.cleanup_nested(known)
+            kill.assert_not_called()
+            self.assertFalse(receipt['cleanupVerified'])
+            self.assertIsNone(receipt['survivors'])
+            self.assertIn('inspection unavailable', receipt['error'])
+
+    def test_owned_close_is_idempotent_and_registry_drained(self):
+        child = self.spawn_harmless('success', 'idempotent')
+        self.assertIn(child, m.ACTIVE_OWNED)
+        child.child.wait(timeout=5)
+        first = copy.deepcopy(child.close())
+        self.assertEqual(first, child.close())
+        self.assertNotIn(child, m.ACTIVE_OWNED)
+        self.assertTrue(first['cleanupVerified'])
+        m.save(self.out, 'idempotent-process', first)
+
     def test_raw_failure_pipeline_stays_failed_with_sampler_failure_and_manifest(self):
         class FakeChild:
             def __init__(self, argv, out, role, env):
@@ -311,4 +336,18 @@ class Controls(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    safe.install_cancellation()
+    code = 1
+    try:
+        code = 0 if unittest.main(exit=False).result.wasSuccessful() else 1
+    except safe.Cancelled as interruption:
+        code = 128 + interruption.signum
+    finally:
+        receipts = safe.finish_active()
+        if safe.REQUESTED_SIGNAL:
+            code = 128 + safe.REQUESTED_SIGNAL
+            saved = os.environ.get('FOLDKIT_NATIVE32_SAFE_CONTROLS_EVIDENCE')
+            if saved:
+                m.save(Path(saved).parent, 'controls-interruption',
+                       {'signal': safe.REQUESTED_SIGNAL, 'exitCode': code, 'activeCleanup': receipts})
+    raise SystemExit(code)

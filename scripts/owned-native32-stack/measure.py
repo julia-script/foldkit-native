@@ -30,6 +30,9 @@ LIMITS = {'originalEnvelopeSeconds': 60, 'sampleSeconds': 25, 'sampleIntervalMil
           'phaseUncertainty': 'Window log precedes attach; no immutable drag-start marker. Startup, resize and drag may overlap.',
           'overhead': 'sample suspends/resumes the target; its overhead can perturb the unchanged 30-second deadline.',
           'interpretation': 'Inclusive sampled occupancy only; not exclusive CPU, paint count, speedup or causal attribution.'}
+ACTIVE_OWNED = []
+DEFER_CANCELLATION = False
+CANCELLATION_CHECK = None
 
 
 def require(value, message):
@@ -66,7 +69,7 @@ def source_identity(root=ROOT):
         require((root / name).read_bytes() == expected, 'frozen main bytes changed: ' + name)
         frozen[name] = sha(expected)
     changed = read_command(['git', 'diff', '--name-only', BASE, head], root).splitlines()
-    allowed = {'scripts/owned-native32-stack/' + name for name in ('measure.py', 'controls_test.py', 'prepare.py')}
+    allowed = {'scripts/owned-native32-stack/' + name for name in ('measure.py', 'controls_test.py', 'prepare.py', 'interrupt_probe.py')}
     allowed.add('.github/workflows/owned-native32-stack-measurement.yml')
     require(changed and set(changed) <= allowed, 'non-qualification delta')
     source = (root / 'examples/pixel-art/native.test.ts').read_text()
@@ -112,14 +115,25 @@ def token(row):
 
 class Owned:
     def __init__(self, argv, out, role, env, factory=subprocess.Popen):
+        global DEFER_CANCELLATION
         self.role, self.known, self.child = role, {}, None
+        self.out, self.closed = out, False
         self.receipt = {'role': role, 'argv': argv, 'start': stamp(), 'rawExit': None,
                         'signals': [], 'cleanupVerified': False, 'survivors': [], 'identity': None}
         self.stdout = (out / (role + '.stdout.log')).open('x')
         self.stderr = (out / (role + '.stderr.log')).open('x')
         try:
-            self.child = factory(argv, cwd=ROOT, env=env, stdout=self.stdout, stderr=self.stderr, start_new_session=True)
+            previous = DEFER_CANCELLATION
+            DEFER_CANCELLATION = True
+            try:
+                self.child = factory(argv, cwd=ROOT, env=env, stdout=self.stdout, stderr=self.stderr, start_new_session=True)
+                ACTIVE_OWNED.append(self)
+            finally:
+                DEFER_CANCELLATION = previous
+            if CANCELLATION_CHECK:
+                CANCELLATION_CHECK()
             self.observe()
+            save(out, role + '-started', self.receipt)
         except BaseException as error:
             self.receipt['spawnOrIdentityError'] = repr(error)
             self.close()
@@ -164,13 +178,15 @@ class Owned:
             except PermissionError:
                 require(not [r for r in table().values() if r['pgid'] == self.child.pid and not r['state'].startswith('Z')], 'owned signal denied with live members')
 
-    def close(self):
+    def close(self, grace_seconds=2):
+        if self.closed:
+            return self.receipt
         try:
             if self.child:
                 if self.child.poll() is None:
                     self.send(signal.SIGTERM)
                     try:
-                        self.child.wait(timeout=2)
+                        self.child.wait(timeout=grace_seconds)
                     except subprocess.TimeoutExpired:
                         self.send(signal.SIGKILL)
                         self.child.wait(timeout=5)
@@ -189,6 +205,9 @@ class Owned:
             if self.child:
                 self.receipt['rawExit'] = self.child.returncode
         finally:
+            self.closed = True
+            if self in ACTIVE_OWNED:
+                ACTIVE_OWNED.remove(self)
             self.receipt['end'] = stamp()
             self.stdout.close()
             self.stderr.close()
