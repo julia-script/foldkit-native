@@ -164,10 +164,12 @@ GitHub Release. Each future change needs a new changeset to advance the version.
 
 The workflow must be present on the default branch; Actions must allow its
 `GITHUB_TOKEN` to create pull requests. This setup changes neither setting.
-GitHub does not automatically start pull-request CI for PRs created/updated
-with that token: a maintainer must close and reopen the version PR using their
-own account (or push a reviewed update) to start the existing PR checks. Merge
-only after normal review and required checks. No extra token, npm secret,
+When that token opens, updates or reopens the version PR, GitHub creates
+pull-request CI runs that require approval. A maintainer with write access
+must select **Approve workflows to run** in the PR's merge box before those
+checks execute ([GitHub token behavior](https://docs.github.com/en/actions/concepts/security/github_token)).
+Merge only after normal review and required checks. Token-triggered push
+and other PR activity events do not start CI. No extra token, npm secret,
 npm environment, registry authentication or OIDC permission is needed here.
 
 Release execution rejects failed/non-push/unrelated/fork CI, checkout drift
@@ -201,7 +203,7 @@ publish command and permission be added. Do not substitute `changeset publish`
 for this GitHub-only release command today.
 
 Based on the [effectmq release workflow](https://github.com/julia-script/effectmq/blob/c656ceb5f409c001c34bf106b6a4c9c0c0619f39/.github/workflows/release.yml),
-[Changesets configuration](https://github.com/changesets/changesets/blob/main/docs/config-file-options.md)
+[Changesets configuration](https://changesets.dev/guide/config)
 and [Changesets action custom publishing](https://github.com/changesets/action/tree/a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d#custom-publishing).
 
 ## Credits and licences
