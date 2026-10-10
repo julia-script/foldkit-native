@@ -242,6 +242,7 @@ class Controls(unittest.TestCase):
         for field, value in [('ppid', 123), ('pgid', 123), ('start', ''), ('command', '/other/vmmap')]:
             variants.append(('mapper' + field, {**mapper, 'identity': {**mapper['identity'], field: value}}, sample, map_raw, raw, BINARY))
         variants.append(('presample-stale', mapper, {**sample, 'targetAtStart': {**row(), 'start': 'stale'}}, map_raw, raw, BINARY))
+        variants.append(('no-mapper-identity', {**mapper, 'identity': None}, sample, map_raw, raw, BINARY))
         for name, text in [('wrong-header', map_raw.replace('[99991]', '[123]')),
                            ('duplicate-header', map_raw + 'Process: bun [99991]\n'),
                            ('denied', 'vmmap: permission denied\n'),
@@ -272,6 +273,10 @@ class Controls(unittest.TestCase):
             rejected[name] = repr(failure.exception)
         with self.assertRaisesRegex(RuntimeError, 'incomplete'):
             m.validate_report(raw, original, sample, BINARY, mapper=mapper)
+        for key in ('identity', 'targetBefore', 'targetAfter', 'targetBeforeObserved', 'targetAfterObserved', 'argv', 'rawExit', 'cleanupVerified'):
+            missing = {k: v for k, v in mapper.items() if k != key}
+            with self.subTest(missing=key), self.assertRaises((RuntimeError, KeyError)):
+                m.validate_report(raw, original, sample, BINARY, mapper=missing, map_raw=map_raw)
         self.out.mkdir()
         m.save(self.out, 'synthetic-map-negatives', {'classification': 'synthetic joint-proof faults only', 'rejected': rejected})
 
@@ -659,6 +664,8 @@ class Controls(unittest.TestCase):
                 identity = row(99993) if role == 'mapper' else row()
                 if role == 'mapper':
                     identity['command'] = '/usr/bin/vmmap'
+                    if mode == 'mapper-no-identity':
+                        identity = None
                 self.receipt = {'role': role, 'argv': argv, 'identity': identity, 'lastResources': row(), 'start': m.stamp(), 'end': m.stamp(),
                                 'rawExit': original_exit if role == 'original' else (13 if mode == 'mapper-fail' else -15 if mode == 'mapper-timeout' else 0) if role == 'mapper' else sampler_exit,
                                 'cleanupVerified': True, 'survivors': [], 'signals': []}
@@ -694,7 +701,8 @@ class Controls(unittest.TestCase):
                  (-15, 0, 'original-timeout'), (0, -15, 'sampler-timeout'),
                  (0, -15, 'sampler-wait-timeout'), (17, None, 'early-original'),
                  (0, 0, 'source-drift'), (0, 0, 'binary-drift'), (17, 13, 'terminal-interrupt'),
-                 (17, None, 'mapper-fail'), (0, None, 'mapper-malformed'), (0, None, 'mapper-timeout')]
+                 (17, None, 'mapper-fail'), (0, None, 'mapper-malformed'), (0, None, 'mapper-timeout'),
+                 (0, None, 'mapper-no-identity')]
         for original_exit, sampler_exit, mode in cases:
             out = self.out / mode
             limits = {**m.LIMITS}
@@ -718,7 +726,7 @@ class Controls(unittest.TestCase):
                 self.assertEqual(actual_exit, 128 - original_exit if original_exit < 0 else original_exit or 1, (out / 'result.json').read_text())
             result = json.loads((out / 'result.json').read_text())
             self.assertEqual(result['originalRawExit'], original_exit)
-            self.assertEqual(result['samplerRawExit'], None if mode in ('early-original', 'original-timeout', 'mapper-fail', 'mapper-malformed', 'mapper-timeout') else sampler_exit)
+            self.assertEqual(result['samplerRawExit'], None if mode in ('early-original', 'original-timeout', 'mapper-fail', 'mapper-malformed', 'mapper-timeout', 'mapper-no-identity') else sampler_exit)
             self.assertEqual(result['mapperRawExit'], None if mode in ('early-original', 'original-timeout') else 13 if mode == 'mapper-fail' else -15 if mode == 'mapper-timeout' else 0)
             self.assertEqual(result['originalVerdict'], 'unproved' if mode in ('source-drift', 'binary-drift') else 'fail' if original_exit else 'pass')
             if mode == 'original-timeout':
@@ -727,7 +735,7 @@ class Controls(unittest.TestCase):
                 self.assertTrue(result['samplerEnvelopeExceeded'])
             if mode == 'mapper-timeout':
                 self.assertTrue(result['mapperEnvelopeExceeded'])
-            if mode in ('mapper-fail', 'mapper-malformed', 'mapper-timeout'):
+            if mode in ('mapper-fail', 'mapper-malformed', 'mapper-timeout', 'mapper-no-identity'):
                 self.assertFalse((out / 'sampler-process.json').exists())
             if mode in ('sampler-wait-timeout', 'original-timeout', 'sampler-timeout'):
                 self.assertIn('Timeout', result['error'])

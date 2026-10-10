@@ -329,7 +329,7 @@ def mapped_text(raw, pid, binary):
     return region
 
 
-def validate_mapping(raw, mapper, original, sampler, binary, image):
+def validate_mapper_identity(mapper, original):
     pid = original['identity']['pid']
     require(mapper['role'] == 'mapper' and mapper['rawExit'] == 0 and mapper['cleanupVerified']
             and mapper['survivors'] == [] and not mapper.get('signals'), 'mapper raw outcome/cleanup incomplete')
@@ -339,9 +339,15 @@ def validate_mapping(raw, mapper, original, sampler, binary, image):
             and own['start'] and own['command'] == '/usr/bin/vmmap', 'mapper owned identity/session differs')
     for key in ('targetBefore', 'targetAfter'):
         observed = mapper[key]
-        require(token(observed) == token(original['identity']) == sampler['targetIdentity']
+        require(token(observed) == token(original['identity'])
                 and observed['ppid'] == original['identity']['ppid'] and observed['pgid'] == pid
                 and not observed['state'].startswith('Z'), 'stale mapper original target identity')
+
+
+def validate_mapping(raw, mapper, original, sampler, binary, image):
+    validate_mapper_identity(mapper, original)
+    pid = original['identity']['pid']
+    require(sampler['targetIdentity'] == token(original['identity']), 'stale mapper/sampler target identity')
     target = sampler['targetAtStart']
     require(token(target) == token(original['identity']) and target['ppid'] == original['identity']['ppid']
             and not target['state'].startswith('Z'), 'stale pre-sample target identity')
@@ -352,7 +358,7 @@ def validate_mapping(raw, mapper, original, sampler, binary, image):
             and 0 <= monotonic[2] - monotonic[1] <= MAPPER_SECONDS, 'mapper interval/order/cap differs')
     region = mapped_text(raw, pid, binary)
     require(image['start'] < image['end'] and region['start'] == image['start'], 'mapped __TEXT/sample image load base differs')
-    return {'region': region, 'mapperIdentity': own, 'targetIdentity': sampler['targetIdentity'],
+    return {'region': region, 'mapperIdentity': mapper['identity'], 'targetIdentity': sampler['targetIdentity'],
             'interval': [mapper['start'], mapper['end']],
             'limits': 'Point-in-time mapping, not uninterrupted residency or in-memory bytes; __TEXT end is not whole-image end.'}
 
@@ -493,6 +499,7 @@ def run(out):
                     mapper.receipt['targetAfter'] = fresh_target(original)
                     mapper.receipt['targetAfterObserved'] = stamp()
                     save(out, 'target-after-map', {'identity': mapper.receipt['targetAfter'], 'observed': mapper.receipt['targetAfterObserved']})
+                    validate_mapper_identity(mapper.receipt, original.receipt)
                     mapped_text((out / 'mapper.stdout.log').read_text(), original.child.pid, deps['binary'])
                     require(time.monotonic() - start <= LIMITS['originalEnvelopeSeconds'], 'original envelope exceeded after mapping')
                     argv = sample_command(original, out)
