@@ -46,7 +46,7 @@ def sha(value):
 def cleaned(state):
     state = obj(state)
     return (state.get('started') is True and state.get('reaped') is True and state.get('groupClean') is True
-            and state.get('deadlineExceeded') is False and not state.get('failure') and not state.get('inspectionFailure')
+            and state.get('deadlineExceeded') is False and state.get('cancelledBy') is None and not state.get('failure') and not state.get('inspectionFailure')
             and state.get('remainingGroupMembers') == [] and type(state.get('returncode')) is int
             and finite(state.get('elapsedSeconds'), True) and state.get('naturalExit') is True and state.get('signals') == [])
 

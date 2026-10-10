@@ -9,6 +9,9 @@ import json
 import os
 from pathlib import Path
 import signal
+import runpy
+import threading
+import time
 import struct
 import subprocess
 import tempfile
@@ -19,6 +22,7 @@ import zlib
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import contract as c
 import run
+run.load_runtime()
 import safe
 import supervise as s
 ROOT = Path(__file__).resolve().parents[2]
@@ -50,9 +54,12 @@ def fixtures(fail=None):
 def owned_child(kind, log, deadline=10):
     command = [sys.executable, '-c', safe.HARMLESS[kind]]
     audit = safe.audit_child(ROOT, command, ENV, kind)
-    state = s.supervise(command, log, ENV, deadline=deadline)
+    state = {}
     log.with_suffix('.audit.json').write_text(json.dumps(audit, indent=2) + '\n')
-    log.with_suffix('.supervision.json').write_text(json.dumps(state, indent=2) + '\n')
+    try:
+        s.supervise(command, log, ENV, deadline=deadline, state=state)
+    finally:
+        log.with_suffix('.supervision.json').write_text(json.dumps(state, indent=2) + '\n')
     return state
 
 
@@ -178,7 +185,7 @@ class Evidence(unittest.TestCase):
 
     def test_serial_fresh_sessions_cleanup_and_natural_exit_required(self):
         name = 'candidate_pixel32'
-        for key, wrong in [('pgid', 100), ('groupClean', False), ('reaped', False), ('naturalExit', False), ('deadlineExceeded', True), ('signals', ['SIGTERM']), ('inspectionFailure', {'type': 'fault'})]:
+        for key, wrong in [('pgid', 100), ('groupClean', False), ('reaped', False), ('naturalExit', False), ('deadlineExceeded', True), ('signals', ['SIGTERM']), ('inspectionFailure', {'type': 'fault'}), ('cancelledBy', 'SIGTERM')]:
             values = fixtures(); values[1][name]['supervision'][key] = wrong
             self.assertFalse(c.validate_all(*values)['completeComparisonEvidence'])
         values = fixtures(); values[1][name]['originalStartedEpoch'] = 1001
@@ -264,12 +271,28 @@ class Ownership(unittest.TestCase):
         child = Mock(pid=123456, returncode=7)
         child.wait.return_value = 7; child.poll.return_value = 7
         for mode in ('inspection', 'signal'):
-            with patch.object(s.subprocess, 'Popen', return_value=child), patch.object(s, 'group_members', side_effect=RuntimeError('owned inspection fault') if mode == 'inspection' else None, return_value=[123456]), patch.object(s.os, 'killpg', side_effect=PermissionError('owned signal fault')):
+            with patch.object(s.subprocess, 'Popen', return_value=child), patch.object(s, 'group_members', side_effect=RuntimeError('owned inspection fault') if mode == 'inspection' else None, return_value=[123456]), patch.object(s.os, 'killpg', side_effect=PermissionError('owned signal fault')), patch.object(s, 'process_identity', return_value={'pid':123456,'pgid':123456,'birth':'owned mocked birth'}):
                 state = s.supervise(['owned mocked child'], self.folder / (mode + '.log'), {}, state={})
             self.assertEqual(state['returncode'], 7)
             self.assertTrue(state['reaped'])
             self.assertFalse(state['groupClean'])
             self.assertFalse(c.cleaned(state))
+
+    def test_nested_reused_pid_is_never_signalled_or_declared_clean(self):
+        child = Mock(pid=123456, returncode=7)
+        child.wait.return_value = 7; child.poll.return_value = 7
+        entry = {'ownerPid':123456,'pid':123457,'pgid':123457,'identity':{'pid':123457,'pgid':123457,'birth':'old owned birth'}}
+        with patch.object(s.subprocess, 'Popen', return_value=child), patch.object(s, 'registered_descendants', return_value=[entry]), patch.object(s, 'group_members', side_effect=lambda pid: [] if pid==123456 else [123457]), patch.object(s, 'process_identity', return_value={'pid':123457,'pgid':123457,'birth':'different reused birth'}), patch.object(s.os, 'killpg') as send:
+            state = s.supervise(['owned mocked child'], self.folder / 'reused.log', {}, state={})
+        send.assert_not_called()
+        self.assertEqual(state['returncode'], 7); self.assertTrue(state['reaped'])
+        self.assertFalse(state['groupClean']); self.assertFalse(c.cleaned(state))
+        self.assertIn('reused', state['failure']['message'])
+        registry = self.folder / 'malformed-registry';registry.mkdir()
+        entry['pgid']=999
+        (registry/'owned.json').write_text(json.dumps(entry))
+        with self.assertRaisesRegex(RuntimeError, 'malformed'):
+            s.registered_descendants(registry,123456)
 
     def test_ordinary_entrypoint_rejects_before_install_capability_or_native(self):
         out = self.folder / 'ordinary'
@@ -309,6 +332,72 @@ class Ownership(unittest.TestCase):
             self.assertTrue((out / name / 'case.json').exists())
         self.assertTrue((out / 'error.json').exists()); self.assertTrue((out / 'cleanup.json').exists())
         return code, summary
+
+    def test_local_module_import_fault_seeds_four_unproved_cases_without_children(self):
+        for module in ('contract', 'supervise'):
+            out = self.folder / ('import-' + module)
+            with patch.dict(sys.modules, {module: None}), patch.object(sys, 'argv', ['run.py', '--out', str(out)]), patch.object(subprocess, 'Popen') as spawn, contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaises(SystemExit) as stopped:
+                    runpy.run_path(str(ROOT / 'scripts/scroll-repair-qualification/run.py'), run_name='__main__')
+            self.assertEqual(stopped.exception.code, 1); spawn.assert_not_called()
+            result = json.loads((out / 'comparison.json').read_text())
+            receipt = json.loads((out / 'provenance.json').read_text())
+            self.assertFalse(result['completeComparisonEvidence'])
+            self.assertEqual(receipt['failures'][0]['stage'], 'runtime-import')
+            self.assertEqual(receipt['failures'][0]['type'], 'ModuleNotFoundError')
+            self.assertNotIn('installSupervision', receipt)
+            for name in c.CASES:
+                self.assertEqual(result['cases'][name]['originalResult'], 'unproved')
+                case = json.loads((out / name / 'case.json').read_text())
+                self.assertFalse(case['supervision']['started']); self.assertFalse(case['capabilitySupervision']['started'])
+
+    def test_actual_outer_term_cleans_active_nested_sessions_and_final_receipts(self):
+        out = self.folder / 'cancel-target'
+        command = [sys.executable, str(ROOT / 'scripts/scroll-repair-qualification/safe.py'), 'cancel-target', '--out', str(out)]
+        audit = safe.audit_child(ROOT, command, ENV, 'safe-cancel-target', out)
+        state, observed, errors = {}, {}, []
+        done = threading.Event()
+        def cancel_when_owned():
+            until = time.monotonic() + 15
+            while not done.is_set() and time.monotonic() < until:
+                targets = list(out.glob('children/cancel-target-*/*.log.ownership.json'))
+                if targets and state.get('pid'):
+                    try:
+                        inner = json.loads(targets[0].read_text())
+                        outer = json.loads((out / 'raw.log.ownership.json').read_text())
+                    except (FileNotFoundError, ValueError):
+                        time.sleep(0.01); continue
+                    if inner.get('stage') != 'owned-before-wait' or not inner.get('pid') or not outer.get('pid'):
+                        time.sleep(0.01); continue
+                    identities = [s.process_identity(pid) for pid in (state['pid'], outer['pid'], inner['pid'])]
+                    if any(identity is None for identity in identities):
+                        time.sleep(0.01); continue
+                    observed.update(outer=state['pid'], supervisor=outer['pid'], harmless=inner['pid'], identities=identities, nestedReceipt=str(targets[0]).replace('.ownership.json', '.supervision.json'))
+                    # Only the exact Popen-created outer process/group is signalled.
+                    current = s.process_identity(state['pid'])
+                    if current != identities[0] or current['pgid'] != state['pgid']:
+                        errors.append('outer identity changed'); return
+                    os.killpg(state['pgid'], signal.SIGTERM)
+                    return
+                time.sleep(0.01)
+            errors.append('active nested target not observed; cancellation not demonstrated')
+        worker = threading.Thread(target=cancel_when_owned, daemon=True); worker.start()
+        try:
+            s.supervise(command, self.folder / 'cancel-outer.log', ENV, deadline=25, state=state)
+        finally:
+            done.set(); worker.join(timeout=2)
+            (self.folder / 'cancellation.json').write_text(json.dumps({'audit':audit,'observed':observed,'outerSupervision':state,'errors':errors}, indent=2) + '\n')
+        self.assertFalse(errors, errors); self.assertTrue(observed)
+        self.assertEqual(state['returncode'], 143); self.assertTrue(c.cleaned(state), state)
+        self.assertEqual(state['signals'], [])  # The controlled outer exited itself after cleanup.
+        final = json.loads((out / 'supervision.json').read_text())
+        inner = json.loads(Path(observed['nestedReceipt']).read_text())
+        self.assertTrue(final['groupClean'] and final['reaped'], final)
+        self.assertTrue(inner['groupClean'] and inner['reaped'], inner)
+        self.assertEqual(final['cancelledBy'], 'SIGTERM'); self.assertEqual(inner['cancelledBy'], 'SIGTERM')
+        for identity in observed['identities']:
+            self.assertEqual(s.group_members(identity['pgid']), [])
+        self.assertFalse(c.cleaned(final)); self.assertFalse(c.cleaned(inner))
 
     def test_earliest_preflight_failure_seeds_all_four_case_artifacts(self):
         self.failure_artifacts(patch.object(run, 'git', side_effect=FileNotFoundError('owned git failure')))
@@ -423,8 +512,19 @@ class Ownership(unittest.TestCase):
         self.assertEqual(spawn.call_count, 1); self.assertFalse(case['supervision']['started'])
 
 
+class CancellationTarget(unittest.TestCase):
+    def test_owned_harmless_child(self):
+        receipts = Path(os.environ['SCROLL_SAFE_RECEIPTS'])
+        receipts.mkdir(parents=True, exist_ok=True)
+        folder = Path(tempfile.mkdtemp(prefix='cancel-target-', dir=receipts))
+        state = owned_child('timeout', folder / 'active.log', deadline=10)
+        self.assertEqual(state['returncode'], 0)
+        self.assertTrue(c.cleaned(state))
+
+
 if __name__ == '__main__':
     # The outer safe runner audits this exact closure before this entrypoint;
     # every real child below repeats its specific audit before spawning.
     safe.audit(ROOT, [sys.executable, *sys.argv], os.environ)
-    unittest.main()
+    with s.cancellation():
+        unittest.main()

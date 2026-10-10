@@ -8,12 +8,14 @@ sys.dont_write_bytecode = True
 import hashlib
 import json
 import os
+import signal
 from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 CHECKS = {
     'controls': (sys.executable, str(ROOT / 'scripts/scroll-repair-qualification/controls.py')),
+    'cancel-target': (sys.executable, str(ROOT / 'scripts/scroll-repair-qualification/controls.py'), 'CancellationTarget'),
     'policy': (sys.executable, str(ROOT / 'scripts/scroll-repair-qualification/controls.py'), 'Selection'),
     'install': ('npm', 'ci', '--ignore-scripts'),
     'typecheck': ('bun', 'run', 'typecheck'),
@@ -32,7 +34,7 @@ HARMLESS = {
     'bytecode': "import contract,sys;assert sys.dont_write_bytecode;print('owned harmless import')",
 }
 # Generated from inspected files; final source review separately pins this policy.
-FINGERPRINTS = {'scripts/scroll-repair-qualification/contract.py': '14cebf552b70f1b02c182c9c400abae1051147e26ed69302ffeee92e6b405c84', 'scripts/scroll-repair-qualification/run.py': '5991c69c30897579848c300ca3f5d5cc35f735e9ec9e4e8983e0a0872ecbb466', 'scripts/scroll-repair-qualification/supervise.py': '25d1d22ef5cd087509940ca16293bc8530410e34f9a542fc11132f6c3ba7abe9', 'scripts/scroll-repair-qualification/controls.py': '08a548cba3a707266a7d3a9961d5ac6d160213debbec1e2cd4529c5b104bdd04', '.github/workflows/scroll-repair-qualification.yml': 'a5778750237370a48a5a17e85d16ce10611dbb4210a17cbc819203cc8e39ebb7', 'examples/big-list/native.test.ts': '3f80e7c97d833e4984a7c890bd25b5a0dad47877f74a1b666f5e2c4ee28a99ec', 'examples/pixel-art/native.test.ts': '2429f96ce5e1d44dd2c184172d41d4bb65c98e0faeb30fee6cff8b6c152ce167', 'packages/foldkit-gpuix/test/support.ts': '9611e874ca4e1954030c22125d896b5f195197ac2abebab041cf7a730c1d78ee', 'examples/support/harness.ts': 'dab0eb03569be919bc71e4196c3ff8046ce8eeda1f9339f77d816c58ffe18c18', 'test/support/dom.ts': '4c199816d8e8803091398c71264655cc4daf555801d9ec946c2d82985e018c0c', 'bunfig.toml': '2b9303e9892be8e3aada7a5036d17d9d13820cb34878eaf527927d337d014bba', 'package.json': 'f66e710d975d40a2ba81fe8f75518a70c4a15bfb54d144b8d12db05c4763ecbf', 'package-lock.json': '93535904b69ec9f551e120066edca66d3488d5969f6b3c3fb464474a583181c8', 'scripts/css.ts': 'ec58287e7a1ff1e0f9ced37220da50c9dfccf74eb7235de199255224576b90e8', 'tsconfig.json': '36536b15f23a96605cf4fa26bec51253669eda2018c6c00e6b8feb935b025951'}
+FINGERPRINTS = {'scripts/scroll-repair-qualification/contract.py': 'f95c20a1888739c48da8e9392f09e9dc129fcb6dd35e8237eed96404b73c4065', 'scripts/scroll-repair-qualification/run.py': '569490c08cf9ee737cd1fb21ed0d930d0c9bce7e477b9d4d6429add3ba16a459', 'scripts/scroll-repair-qualification/supervise.py': '5994328a5cb4e38fa62381802093294e9c6c5a81ede1712d7946420d5a5b0f8e', 'scripts/scroll-repair-qualification/controls.py': '8c8d16995bd075deef4075802e934ba59b2fe6375baed3d16d7672b124a2a1a6', '.github/workflows/scroll-repair-qualification.yml': 'a5778750237370a48a5a17e85d16ce10611dbb4210a17cbc819203cc8e39ebb7', 'examples/big-list/native.test.ts': '3f80e7c97d833e4984a7c890bd25b5a0dad47877f74a1b666f5e2c4ee28a99ec', 'examples/pixel-art/native.test.ts': '2429f96ce5e1d44dd2c184172d41d4bb65c98e0faeb30fee6cff8b6c152ce167', 'packages/foldkit-gpuix/test/support.ts': '9611e874ca4e1954030c22125d896b5f195197ac2abebab041cf7a730c1d78ee', 'examples/support/harness.ts': 'dab0eb03569be919bc71e4196c3ff8046ce8eeda1f9339f77d816c58ffe18c18', 'test/support/dom.ts': '4c199816d8e8803091398c71264655cc4daf555801d9ec946c2d82985e018c0c', 'bunfig.toml': '2b9303e9892be8e3aada7a5036d17d9d13820cb34878eaf527927d337d014bba', 'package.json': 'f66e710d975d40a2ba81fe8f75518a70c4a15bfb54d144b8d12db05c4763ecbf', 'package-lock.json': '93535904b69ec9f551e120066edca66d3488d5969f6b3c3fb464474a583181c8', 'scripts/css.ts': 'ec58287e7a1ff1e0f9ced37220da50c9dfccf74eb7235de199255224576b90e8', 'tsconfig.json': '36536b15f23a96605cf4fa26bec51253669eda2018c6c00e6b8feb935b025951'}
 
 
 class Rejected(ValueError):
@@ -65,6 +67,12 @@ def audit_child(root, command, environment, kind, owned=None):
     if kind in HARMLESS:
         if command != [sys.executable, '-c', HARMLESS[kind]]:
             raise Rejected('Harmless program bytes changed')
+    elif kind == 'safe-cancel-target':
+        if owned is None or command != [sys.executable, str(ROOT / 'scripts/scroll-repair-qualification/safe.py'), 'cancel-target', '--out', str(owned)]:
+            raise Rejected('Cancellation target command changed')
+        target = Path(owned).resolve()
+        if target.exists() or target.is_relative_to(ROOT) or environment.get('GITHUB_ACTIONS'):
+            raise Rejected('Cancellation target must use a fresh external harmless owner')
     elif kind == 'clone':
         if owned is None or command != ['git', 'clone', '--shared', '--quiet', str(ROOT), str(owned)]:
             raise Rejected('Owned local clone command changed')
@@ -104,13 +112,39 @@ def main():
         raise Rejected('Local receipts must be outside source')
     out.mkdir(parents=True, exist_ok=False)
     (out / 'audit.json').write_text(json.dumps(receipt, indent=2) + '\n')
-    from supervise import supervise
-    argv = list(command) if command[0] == sys.executable else ['rtk', 'proxy', *command]
-    env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'SCROLL_SAFE_RECEIPTS': str(out / 'children')}
-    state = supervise(argv, out / 'raw.log', env, deadline=180)
-    (out / 'supervision.json').write_text(json.dumps(state, indent=2) + '\n')
-    from contract import cleaned
+    state = {'started': False, 'returncode': None, 'reaped': False, 'groupClean': False, 'failure': None}
+    interrupted = None
+    pending = []
+    def stop(signum, _frame):
+        if not pending:
+            pending.append(signum)
+            error = KeyboardInterrupt('entrypoint cancelled by ' + signal.Signals(signum).name)
+            error.signum = signum
+            raise error
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        from supervise import supervise
+        from contract import cleaned
+        argv = list(command) if command[0] == sys.executable else ['rtk', 'proxy', *command]
+        env = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'SCROLL_SAFE_RECEIPTS': str(out / 'children'),
+               'SCROLL_QUALIFICATION_OWNERSHIP': os.environ.get('SCROLL_QUALIFICATION_OWNERSHIP') or str(out / 'ownership-registry')}
+        supervise(argv, out / 'raw.log', env, deadline=180, state=state)
+    except BaseException as error:
+        interrupted = getattr(error, 'signum', None)
+        if interrupted and not pending:
+            pending.append(interrupted)
+        state['entrypointFailure'] = {'type': type(error).__name__, 'message': str(error)[:2000]}
+    finally:
+        with (out / 'supervision.json').open('x') as file:
+            file.write(json.dumps(state, indent=2) + '\n'); file.flush(); os.fsync(file.fileno())
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
+    if interrupted:
+        return 128 + interrupted
+    if state.get('entrypointFailure'):
+        return 1
     return state['returncode'] if cleaned(state) and 0 <= state['returncode'] < 256 else 1
+
 
 
 if __name__ == '__main__':

@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import signal
 from pathlib import Path
 import platform
 import shutil
@@ -21,8 +22,24 @@ import zlib
 
 sys.dont_write_bytecode = True
 os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
-from contract import BASE, CANDIDATE, CASES, SPECS, command_for, capability_command, DELTA, DRIVER, METHODS, BLOCK_ENV, digest, validate_all, exit_code
-from supervise import supervise
+# Standard-library-only bootstrap must precede every local-module import.
+BOOTSTRAP_CASES = {
+    'baseline_big_list': '7b5aaf49eb9ee49b5c6a596a8e6db8d1207f25fa',
+    'candidate_big_list': '2c8347cb327a11d4f6bee4aaeb48a82f4774f764',
+    'baseline_pixel32': '7b5aaf49eb9ee49b5c6a596a8e6db8d1207f25fa',
+    'candidate_pixel32': '2c8347cb327a11d4f6bee4aaeb48a82f4774f764',
+}
+
+
+def load_runtime():
+    import contract
+    import supervise as supervisor
+    if {name: spec['head'] for name, spec in contract.CASES.items()} != BOOTSTRAP_CASES:
+        raise RuntimeError('bootstrap immutable case contract differs')
+    for name in ('BASE', 'CANDIDATE', 'CASES', 'SPECS', 'command_for', 'capability_command', 'DELTA', 'DRIVER', 'METHODS', 'BLOCK_ENV', 'digest', 'validate_all', 'exit_code'):
+        globals()[name] = getattr(contract, name)
+    globals()['supervise'] = supervisor.supervise
+    return supervisor
 
 
 def write(path, value):
@@ -110,8 +127,7 @@ def seed(out):
                "python": {"executable": sys.executable, "version": sys.version, "cachePrefix": getattr(sys, "pycache_prefix", None),
                           "bytecodeDisabled": sys.dont_write_bytecode, "inheritedBytecodePolicy": os.environ.get("PYTHONDONTWRITEBYTECODE")}}
     cases = {}
-    for name, spec in CASES.items():
-        head = spec["head"]
+    for name, head in BOOTSTRAP_CASES.items():
         folder = out / name
         folder.mkdir()
         for file in ("original.log", "capability.log", "prepare.log", "cleanup.log"):
@@ -122,7 +138,7 @@ def seed(out):
     write(out / "provenance.json", receipt)
     write(out / "error.json", {"stage": "startup", "failure": None})
     write(out / "cleanup.json", {})
-    write(out / "comparison.json", {"completeComparisonEvidence": False, "problems": ["startup incomplete"], "cases": {name: {"originalResult": "unproved", "originalExit": None} for name in CASES}})
+    write(out / "comparison.json", {"completeComparisonEvidence": False, "problems": ["startup incomplete"], "cases": {name: {"originalResult": "unproved", "originalExit": None} for name in BOOTSTRAP_CASES}})
     return receipt, cases
 
 
@@ -277,10 +293,26 @@ def main(argv=None):
     expected, owned, cleanup = {}, {}, {}
     dependency, bun = {}, "unproved"
     failures = []
+    interrupted = None
+    pending = []
+    def stop(signum, _frame):
+        if not pending:
+            pending.append(signum)
+            error = KeyboardInterrupt('entrypoint cancelled by ' + signal.Signals(signum).name)
+            error.signum = signum
+            raise error
+    previous = {sig: signal.signal(sig, stop) for sig in (signal.SIGTERM, signal.SIGINT)}
     try:
-        dependency, bun = execute(root, out, receipt, cases, expected, owned)
+        receipt["stage"] = "runtime-import"
+        supervisor = load_runtime()
+        os.environ["SCROLL_QUALIFICATION_OWNERSHIP"] = str(out / "ownership-registry")
+        with supervisor.cancellation():
+            dependency, bun = execute(root, out, receipt, cases, expected, owned)
     except BaseException as error:
         failures.append({"stage": receipt["stage"], "type": type(error).__name__, "message": str(error)[:2000]})
+        interrupted = getattr(error, "signum", None)
+        if interrupted and not pending:
+            pending.append(interrupted)
     finally:
         try:
             cleanup = cleanup_sources(root, out, owned, cases)
@@ -289,26 +321,33 @@ def main(argv=None):
                     failures.append({"stage": "cleanup:" + name, **case["cleanupFailure"]})
         except BaseException as error:
             failures.append({"stage": "cleanup", "type": type(error).__name__, "message": str(error)[:2000]})
-        for name in CASES:
+        for name in BOOTSTRAP_CASES:
             write(out / name / "case.json", cases[name])
         try:
             result = validate_all(receipt, cases, expected, dependency, bun, cleanup)
         except BaseException as error:
             failures.append({"stage": "validation", "type": type(error).__name__, "message": str(error)[:2000]})
-            result = {"completeComparisonEvidence": False, "candidateOriginalTestsPassed": False, "baselineOriginalTestsPassed": False, "allOriginalTestsPassed": False, "problems": ["validation failed"], "cases": {name: {"originalResult": "unproved", "originalExit": cases[name].get("supervision", {}).get("returncode")} for name in CASES}}
+            result = {"completeComparisonEvidence": False, "candidateOriginalTestsPassed": False, "baselineOriginalTestsPassed": False, "allOriginalTestsPassed": False, "problems": ["validation failed"], "cases": {name: {"originalResult": "unproved", "originalExit": cases[name].get("supervision", {}).get("returncode")} for name in BOOTSTRAP_CASES}}
         if failures:
             result["completeComparisonEvidence"] = False
             result["candidateOriginalTestsPassed"] = False
             result["baselineOriginalTestsPassed"] = False
             result["allOriginalTestsPassed"] = False
             result["problems"].extend(failures)
-        receipt.update(stage="finished", failures=failures)
+        receipt.update(stage="finished", failures=failures, cancelledBy=interrupted)
         write(out / "provenance.json", receipt)
         write(out / "error.json", {"failures": failures})
         write(out / "cleanup.json", cleanup)
         write(out / "comparison.json", result)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     print(json.dumps(result))
-    return exit_code(result)
+    if 'exit_code' in globals():
+        code = exit_code(result)
+    else:
+        known = [case.get('supervision', {}).get('returncode') for case in cases.values()]
+        code = next((value if 0 < value < 256 else 1 for value in known if type(value) is int and value != 0), 1)
+    return code if code != 0 else 128 + interrupted if interrupted else code
 
 
 if __name__ == "__main__":
