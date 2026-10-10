@@ -54,6 +54,8 @@ import {
   isNaturallyFocusable,
 } from './dom.ts'
 import { type Box, createGuard, createLayout } from './layout.ts'
+import { isSecretField, secretValues } from './automation.ts'
+import type { AutomationSecrets } from './automation-secrets.ts'
 import { type Declared, INHERITED, type Sheet, type State, type Viewport, declarations, declared, fold, resolveVars, textStyle, toStyle } from './sheet.ts'
 
 /** DOM event → the gpuix events that produce it. EVENTS.md is the contract. */
@@ -132,6 +134,7 @@ const nativeType = (element: NativeElement): string => {
 export type HostTimings = { syncMs: number; restyled: number; mutations: number; inputAt?: number }
 
 export type HostOptions = {
+  secrets?: AutomationSecrets
   renderer: NativeRenderer
   sheets: Array<Sheet>
   /** The window's size now, for `@media`, `vh` and `vw`. */
@@ -144,7 +147,7 @@ export type HostOptions = {
 }
 
 export const createHost = (document: NativeDocument, options: HostOptions) => {
-  const { renderer, sheets } = options
+  const { renderer, sheets, secrets } = options
   const state = createRendererState(renderer)
   const eventHandlers = new Map<number, Map<string, (event: EventPayload) => void>>()
   const mutations = createMutationQueue(renderer, ids => {
@@ -194,7 +197,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     autofocus = []
     if (wanted !== undefined && isFocusable(wanted)) setFocus(wanted, false)
     const pending = mutations.pending
-    mutations.flushMutations()
+    try {
+      mutations.flushMutations()
+    } catch (error) {
+      secrets?.invalidate()
+      throw error
+    }
+    if (pending > 0 || secrets?.dirty) secrets?.submitted(secretValues(document.querySelectorAll('input, textarea')))
     if (pending > 0) layout.moved()
     options.onSynced?.({ syncMs: performance.now() - started, restyled, mutations: pending, ...(inputAt === undefined ? {} : { inputAt }) })
     inputAt = undefined
@@ -590,6 +599,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   /** A field the person can't edit: read-only, or disabled. */
   const isLocked = (element: NativeElement) => element.hasAttribute('readonly') || isDisabled(element)
   const syncProps = (element: NativeElement) => {
+    if (isSecretField(element)) secrets?.capture(element.value)
     const id = element.nativeId
     const next = propsOf(element)
     const sent = sentProps.get(element) ?? new Map<string, unknown>()
@@ -747,7 +757,10 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     }
   }
   const unmount = (node: NativeNode) => {
-    if (node instanceof NativeElement) settled(node)
+    if (node instanceof NativeElement) {
+      cancelEdit(node)
+      settled(node)
+    }
     if (node.nativeId !== 0) {
       unregisterEventHandlers(eventHandlers, node.nativeId)
       nodes.delete(node.nativeId)
@@ -978,6 +991,8 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   // for one task; if a Tab keydown came for that field around it, the change
   // is dropped and GPUI's editor gets the old value back. Otherwise (a pasted
   // tab) it goes through, a task late. FoldKit never sees the tab Tab typed.
+  // A newer native or controlled value supersedes the held change: its
+  // timer must never write an older value or emit input after the newer one.
   // Per field: Tabs GPUI queues together go to one field, then the next,
   // before the first field's change comes in.
   const tabbedAt = new WeakMap<NativeElement, number>()
@@ -987,6 +1002,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   const onlyAddsTabs = (before: string, after: string) =>
     after.length > before.length && after.replace(/\t/g, '') === before.replace(/\t/g, '')
   const typedByTab = (element: NativeElement) => performance.now() - (tabbedAt.get(element) ?? -Infinity) < 100
+  const pendingEdits = new Map<NativeElement, ReturnType<typeof setTimeout>>()
+  const cancelEdit = (element: NativeElement) => {
+    const timer = pendingEdits.get(element)
+    if (timer === undefined) return
+    clearTimeout(timer)
+    pendingEdits.delete(element)
+  }
 
   // KEYS
   // Keys come from GPUI's window key events only (no element listens for
@@ -1148,7 +1170,12 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         return
       case 'change': {
         inputAt = performance.now()
+        cancelEdit(element)
         const value = unnudged(element, event.value ?? '')
+        if (isSecretField(element)) {
+          secrets?.capture(value)
+          if (secrets !== undefined) schedule()
+        }
         // An edit GPUI's editor took before it heard the field was disabled
         // or made read-only (it applies edits at once): the DOM refuses it
         // and the editor gets the value back.
@@ -1156,10 +1183,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         if (onlyAddsTabs(element.value, value)) {
           const before = element.value
           if (typedByTab(element)) return restoreValue(element, before)
-          setTimeout(() => {
-            if (typedByTab(element)) restoreValue(element, before)
+          const id = element.nativeId
+          pendingEdits.set(element, setTimeout(() => {
+            pendingEdits.delete(element)
+            if (detached || element.nativeId !== id || !element.isConnected) return
+            if (isLocked(element) || typedByTab(element)) restoreValue(element, before)
             else typed(element, value)
-          }, 0)
+          }, 0))
           return
         }
         typed(element, value)
@@ -1735,7 +1765,12 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
       schedule()
     },
     changed: (element, what) => {
+      if (element.nativeId !== 0 && isField(element) && (what === 'value' || what === 'autocomplete')) {
+        secrets?.changed()
+        if (isSecretField(element)) secrets?.capture(element.value)
+      }
       if (what === 'value') {
+        cancelEdit(element)
         if (element.nativeId !== 0) syncProps(element)
         schedule()
         return
@@ -1941,6 +1976,9 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     detach: (options: { windowGone?: boolean } = {}) => {
       if (detached) return
       detached = true
+      for (const timer of pendingEdits.values()) clearTimeout(timer)
+      pendingEdits.clear()
+      secrets?.dispose()
       if (drawTimer !== undefined) clearTimeout(drawTimer)
       drawTimer = undefined
       drawWaiters = []

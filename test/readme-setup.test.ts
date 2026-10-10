@@ -68,6 +68,16 @@ for (const owned of [true, false]) {
       await app.settle()
       expect(app.unsupported).toEqual([])
       expect(app.texts()).toContain('Count: 0')
+      // Effective adapter styles and forwarded fills, not physical pixel proof.
+      for (const selector of ['body', '.app', 'p', 'button']) {
+        const element = app.document.querySelector(selector)!
+        const style = app.window.getComputedStyle(element)
+        expect(style.getPropertyValue('color')).toBe('#000000')
+        if (selector === 'body' || selector === '.app') {
+          expect(style.getPropertyValue('background-color')).toBe('#ffffff')
+          expect(app.gpui.node(element.nativeId).style['backgroundColor']).toBe('#ffffff')
+        }
+      }
       await app.click('+1')
       expect(app.texts()).toContain('Count: 1')
       expect(app.gpui.retainedCount()).toBeGreaterThan(0)
