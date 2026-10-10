@@ -79,6 +79,70 @@ class Controls(unittest.TestCase):
             spawn.assert_not_called()
         self.assertFalse(json.loads((self.out / 'result.json').read_text())['spawned'])
 
+    def test_real_shallow_history_failure_full_history_and_strict_source_negatives(self):
+        self.out.mkdir()
+        evidence = {'classification': 'real disposable Git history; no native or sampler', 'commands': [], 'rejections': {}}
+        popen = subprocess.Popen
+
+        def git_only(argv, *args, **kwargs):
+            self.assertIsInstance(argv, list)
+            self.assertEqual(argv[0], 'git', 'unexpected non-Git child before native boundary')
+            return popen(argv, *args, **kwargs)
+
+        def git(args, cwd):
+            argv = ['git', *args]
+            result = subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=15)
+            evidence['commands'].append({'argv': argv, 'rawExit': result.returncode,
+                                         'stdout': result.stdout, 'stderr': result.stderr})
+            return result
+
+        with tempfile.TemporaryDirectory() as directory, patch.object(subprocess, 'Popen', side_effect=git_only):
+            checkout = Path(directory) / 'checkout'
+            head = git(['rev-parse', 'HEAD'], m.ROOT).stdout.strip()
+            branch = git(['branch', '--show-current'], m.ROOT).stdout.strip()
+            self.assertEqual(git(['clone', '--depth=1', '--single-branch', '--branch', branch,
+                                  '--no-tags', m.ROOT.as_uri(), str(checkout)], m.ROOT).returncode, 0)
+            self.assertEqual(git(['rev-parse', 'HEAD'], checkout).stdout.strip(), head)
+            self.assertEqual(git(['rev-parse', '--is-shallow-repository'], checkout).stdout.strip(), 'true')
+            missing = git(['ls-tree', '-r', '--name-only', m.BASE], checkout)
+            self.assertEqual(missing.returncode, 128)
+            self.assertIn('not a tree object', missing.stderr)
+            with patch.dict(os.environ, {'GITHUB_SHA': head}):
+                with self.assertRaises(subprocess.CalledProcessError) as rejected:
+                    m.source_identity(checkout)
+                self.assertEqual(rejected.exception.returncode, 128)
+                self.assertEqual(rejected.exception.cmd, ['git', 'ls-tree', '-r', '--name-only', m.BASE])
+                evidence['rejections']['missingBase'] = repr(rejected.exception)
+                self.assertEqual(git(['fetch', '--unshallow', '--no-tags', 'origin'], checkout).returncode, 0)
+                self.assertEqual(git(['rev-parse', '--is-shallow-repository'], checkout).stdout.strip(), 'false')
+                identity = m.source_identity(checkout)
+                self.assertEqual(identity['head'], head)
+                self.assertEqual(identity['base'], m.BASE)
+                self.assertEqual(len(identity['mainHashes']), 292)
+                evidence['availableBaseIdentity'] = identity
+                with patch.dict(os.environ, {'GITHUB_SHA': 'f' * 40}), self.assertRaisesRegex(RuntimeError, 'wrong reviewed driver head') as rejected:
+                    m.source_identity(checkout)
+                evidence['rejections']['wrongHead'] = repr(rejected.exception)
+                with patch.object(m, 'BASE', head), self.assertRaisesRegex(RuntimeError, 'non-qualification delta') as rejected:
+                    m.source_identity(checkout)
+                evidence['rejections']['wrongPresentBase'] = repr(rejected.exception)
+                fixture = checkout / 'examples/pixel-art/native.test.ts'
+                original = fixture.read_bytes()
+                fixture.write_bytes(original + b'\n// safe disposable source drift\n')
+                with self.assertRaisesRegex(RuntimeError, 'dirty qualification checkout') as rejected:
+                    m.source_identity(checkout)
+                evidence['rejections']['modifiedFixture'] = repr(rejected.exception)
+                fixture.write_bytes(original)
+                (checkout / 'unexpected.txt').write_text('safe disposable dirty untracked source')
+                with self.assertRaisesRegex(RuntimeError, 'dirty qualification checkout') as rejected:
+                    m.source_identity(checkout)
+                evidence['rejections']['untrackedSource'] = repr(rejected.exception)
+                (checkout / 'unexpected.txt').unlink()
+                self.assertEqual(m.source_identity(checkout), identity)
+        workflow = (m.ROOT / '.github/workflows/owned-native32-stack-measurement.yml').read_text()
+        self.assertIn('          fetch-depth: 0\n', workflow)
+        m.save(self.out, 'history-availability', evidence)
+
     def test_safe_harmless_argv_source_allowlist_rejects_native_and_modified_program(self):
         for argv in (['bun', 'test'], [sys.executable, '-c', 'import ctypes; ctypes.CDLL("gpuix.node")'],
                      [sys.executable, '-c', safe.SAFE_PROGRAMS['success'], 'extra'],
