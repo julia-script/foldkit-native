@@ -191,7 +191,7 @@ export type AttachOptions = {
   dataDir?: string
   /** Errors a browser would report rather than throw, with where they came
    *  from: a DOM listener's or an animation frame's (the next ones still
-   *  run), the frame loop's, a native event's, a close handler's, the
+   *  run), the frame loop's, a native event's, a close handler's or teardown's, the
    *  store's. Without it they go to `console.error`. */
   onError?: (report: ErrorReport) => void
   /** The clock GPUI's geometry queries are timed by (tests). */
@@ -259,18 +259,26 @@ export const attachGpuix = (renderer: NativeRenderer, options: AttachOptions = {
     /** Takes it all down, in order: owned runtimes (their Subscriptions,
      *  Mounts, Commands and listeners stop, and FoldKit empties the
      *  container), pending animation frames, the native tree and GPUI
-     *  handlers (gpuix's retained count goes to zero), then the globals. */
+     *  handlers (gpuix's retained count goes to zero), then the globals.
+     *  Attempts every step even after a failure, then throws that error
+     *  (an AggregateError when several steps failed). */
     detach: (options: { windowGone?: boolean } = {}) => {
       if (detached) return
       detached = true
-      try {
-        for (const handle of owned.splice(0).reverse()) handle.dispose()
-        window.cancelAllFrames()
-        host.detach(options)
-      } finally {
-        // The globals go back even when GPUI's teardown throws.
-        restore()
+      const errors: Array<unknown> = []
+      const attempt = (release: () => void) => {
+        try {
+          release()
+        } catch (error) {
+          errors.push(error)
+        }
       }
+      for (const handle of owned.splice(0).reverse()) attempt(() => handle.dispose())
+      attempt(() => window.cancelAllFrames())
+      attempt(() => host.detach(options))
+      attempt(restore)
+      if (errors.length === 1) throw errors[0]
+      if (errors.length > 1) throw new AggregateError(errors, 'foldkit-gpuix: teardown failed')
     },
   }
 }
@@ -350,7 +358,6 @@ export const mountGpuix = (options: NativeOptions = {}) => {
   // OPEN: gpuix loads now, so a missing library is explained too (start.ts).
   let renderer: WindowRenderer
   let gpuix: ReturnType<typeof loadGpuix>
-  const stdinBefore = new Set(process.stdin.listeners('data'))
   try {
     gpuix = loadGpuix()
     if (createRenderer === undefined) preflightDisplay()
@@ -375,9 +382,14 @@ export const mountGpuix = (options: NativeOptions = {}) => {
   // gpuix's own GpuixRenderer, not createNativeRenderer's, which would serve
   // it whenever stdin isn't a terminal.
   // It serves the renderer less a person's secrets (automation.ts).
+  let automationListeners: ReturnType<typeof process.stdin.listeners> = []
   if (automationRequested(automation)) {
     const fields = () => attached?.document.querySelectorAll('input, textarea') ?? []
+    // gpuix 0.10 returns no disposer. Capture only the listeners its
+    // synchronous registration adds, before any other app or host work.
+    const before = new Set(process.stdin.listeners('data'))
     gpuix.runtime.enableAutomation(redactingRenderer(renderer, () => secretValues(fields() as never)) as never)
+    automationListeners = process.stdin.listeners('data').filter(listener => !before.has(listener))
   }
 
   const { width, height } = windowOptions
@@ -417,12 +429,18 @@ export const mountGpuix = (options: NativeOptions = {}) => {
   const finish = () => {
     if (done) return
     done = true
-    loop.stop()
-    app.detach({ windowGone })
-    // The automation listener gpuix put on stdin, so it can't hold the process.
-    const added = process.stdin.listeners('data').filter(listener => !stdinBefore.has(listener))
-    for (const listener of added) process.stdin.off('data', listener as never)
-    if (added.length > 0 && process.stdin.listenerCount('data') === 0) process.stdin.pause()
+    const attempt = (release: () => void) => {
+      try {
+        release()
+      } catch (error) {
+        report('close', error, { reason: windowGone ? 'window' : 'close', stage: 'teardown' })
+      }
+    }
+    attempt(() => loop.stop())
+    attempt(() => app.detach({ windowGone }))
+    // Release only this app's automation listeners, even if detach failed.
+    for (const listener of automationListeners) attempt(() => { process.stdin.off('data', listener as never) })
+    if (automationListeners.length > 0 && process.stdin.listenerCount('data') === 0) attempt(() => process.stdin.pause())
     resolveClosed()
     if (exitOnClose) process.exit(0)
   }
@@ -475,14 +493,17 @@ export const mountGpuix = (options: NativeOptions = {}) => {
     /** Asks the close handlers (one may `preventDefault()`), then releases
      *  everything the app owns: its runtimes, animation frames, the native
      *  tree and handlers, the globals, the frame loop and stdin. Resolves
-     *  `false` if a handler kept the window open. `force` can't be vetoed. */
+     *  `false` if a handler kept the window open. `force` can't be vetoed.
+     *  Teardown errors are reported through `onError` (phase `close`, stage
+     *  `teardown`); all steps are attempted and closing still resolves `true`. */
     close,
     /** Adds a close handler; returns a function that removes it. */
     onClose: (handler: CloseHandler) => {
       handlers.add(handler)
       return () => void handlers.delete(handler)
     },
-    /** Resolves once everything is released (with `exitOnClose: false`). */
+    /** Resolves after all cleanup attempts (with `exitOnClose: false`),
+     *  including when teardown errors were reported through `onError`. */
     closed,
   }
 }
