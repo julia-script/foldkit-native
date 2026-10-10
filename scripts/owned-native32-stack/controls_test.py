@@ -250,6 +250,7 @@ class Controls(unittest.TestCase):
                            ('wildcard-path', map_raw.replace(BINARY['path'], '/Users/*/gpuix-native.darwin-arm64.node')),
                            ('relative-path', map_raw.replace(BINARY['path'], 'gpuix-native.darwin-arm64.node')),
                            ('duplicate', map_raw + map_raw.split('\n')[1] + '\n'),
+                           ('duplicate-tabbed', map_raw + map_raw.split('\n')[1].replace('__TEXT ', '__TEXT\t') + '\n'),
                            ('missing', map_raw.split('\n')[0] + '\n'),
                            ('base', map_raw.replace('00001000', '00001100')),
                            ('reversed', map_raw.replace('00001800', '00000001')),
@@ -266,6 +267,7 @@ class Controls(unittest.TestCase):
         variants.append(('uuid', mapper, sample, map_raw, raw.replace(UUID, 'A' * 36), BINARY))
         variants.append(('hash', mapper, sample, map_raw, raw, {**BINARY, 'sha256': '0' * 64}))
         variants.append(('ambiguous-image', mapper, sample, map_raw, raw + raw.split('Binary Images:\n')[1], BINARY))
+        variants.append(('malformed-extra-image', mapper, sample, map_raw, raw + 'MALFORMED gpuix-native.darwin-arm64.node\n', BINARY))
         rejected = {}
         for name, packet, sampling, mapped, report_raw, binary in variants:
             with self.subTest(name=name), self.assertRaises(RuntimeError) as failure:

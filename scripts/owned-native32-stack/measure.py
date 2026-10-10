@@ -293,7 +293,7 @@ def mapper_command(target):
 
 def image_diagnostics(raw, binary):
     section = raw.split('Binary Images:', 1)[1] if 'Binary Images:' in raw else ''
-    candidates = []
+    candidates, unparsed = [], []
     for line in section.splitlines():
         match = re.fullmatch(r'\s*(0x[0-9a-fA-F]+)\s*-\s*(0x[0-9a-fA-F]+)\s+\+?'
                              r'gpuix-native\.darwin-arm64\.node(?:\s+\([^\r\n]*?\))?'
@@ -301,7 +301,10 @@ def image_diagnostics(raw, binary):
         if match:
             candidates.append({'raw': line, 'start': int(match[1], 16), 'end': int(match[2], 16),
                                'uuid': match[3].upper(), 'path': match[4]})
+        elif 'gpuix-native.darwin-arm64.node' in line:
+            unparsed.append(line)
     return {'nativeRows': candidates, 'nativeRowCount': len(candidates),
+            'unparsedNativeRows': unparsed,
             'matchingUUIDCount': sum(r['uuid'] == binary['uuid'] for r in candidates),
             'exactPathCount': sum(r['path'] == binary['path'] for r in candidates),
             'redactedPathCount': sum('*' in r['path'] for r in candidates),
@@ -313,7 +316,7 @@ def mapped_text(raw, pid, binary):
     require(headers == ['bun [' + str(pid) + ']'], 'mapper header PID/name differs/ambiguous')
     candidates = []
     for line in raw.splitlines():
-        if not line.lstrip().startswith('__TEXT ') or 'gpuix-native.darwin-arm64.node' not in line:
+        if not re.match(r'^\s*__TEXT\b', line) or 'gpuix-native.darwin-arm64.node' not in line:
             continue
         match = re.fullmatch(r'\s*__TEXT\s+([0-9a-fA-F]+)-([0-9a-fA-F]+)\s+\[[^\]\r\n]+\]'
                              r'\s+([rwx-]{3})/([rwx-]{3})\s+SM=COW\s+(.+?)\s*', line)
@@ -390,7 +393,7 @@ def validate_report(raw, original, sampler, binary, synthetic=False, mapper=None
             positive_frames.append((line, frame[2]))
     require(positive_frames, 'empty/malformed stack tree: no positive image-linked frames')
     diagnostic = image_diagnostics(raw, binary)
-    require(diagnostic['nativeRowCount'] == 1 and diagnostic['matchingUUIDCount'] == 1,
+    require(diagnostic['nativeRowCount'] == 1 and diagnostic['matchingUUIDCount'] == 1 and not diagnostic['unparsedNativeRows'],
             'loaded-image UUID missing/different/ambiguous')
     image = diagnostic['nativeRows'][0]
     require(image['start'] < image['end'], 'invalid sample image interval')
