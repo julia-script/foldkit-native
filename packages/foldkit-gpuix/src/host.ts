@@ -54,6 +54,7 @@ import {
   isNaturallyFocusable,
 } from './dom.ts'
 import { type Box, createGuard, createLayout } from './layout.ts'
+import { autonomousStyle, paintBatch, paintStyle } from './layout-invalidation-prototype.ts'
 import { isSecretField, secretValues } from './automation.ts'
 import type { AutomationSecrets } from './automation-secrets.ts'
 import { type Declared, INHERITED, type Sheet, type State, type Viewport, declarations, declared, fold, resolveVars, textStyle, toStyle } from './sheet.ts'
@@ -157,6 +158,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     }
   })
   const nodes = new Map<number, NativeNode>()
+  const layoutBatch = paintBatch()
   let nextId = 1_000_000 // Clear of gpuix's own ids for window events.
   const body = document.body
 
@@ -200,11 +202,14 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     try {
       mutations.flushMutations()
     } catch (error) {
+      layoutBatch.reset()
       secrets?.invalidate()
       throw error
     }
+    const batchMoved = layoutBatch.moved(pending, false)
+    layoutBatch.reset()
     if (pending > 0 || secrets?.dirty) secrets?.submitted(secretValues(document.querySelectorAll('input, textarea')))
-    if (pending > 0) layout.moved()
+    if (pending > 0 && (batchMoved || autonomousGeometry())) layout.moved()
     options.onSynced?.({ syncMs: performance.now() - started, restyled, mutations: pending, ...(inputAt === undefined ? {} : { inputAt }) })
     inputAt = undefined
   }
@@ -460,6 +465,21 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
 
   /** The style last sent per element, for its border box (boundsOf). */
   const sentStyles = new WeakMap<NativeElement, StyleDesc>()
+  // Global, not just ancestors: a moving flow sibling can move a painted cell.
+  const autonomousGeometry = () => {
+    try {
+      for (const node of nodes.values()) {
+        if (!(node instanceof NativeElement) || !node.isConnected) continue
+        if (nativeType(node) !== 'div' || node.getAttributeNames().some(name => name.startsWith('data-fn-'))) return true
+        if (autonomousStyle(sentStyles.get(node))) return true
+        if (aspects.has(node) && !aspectHeights.has(node)) return true
+      }
+      return false
+    } catch {
+      // Unknown inspection must not introduce a new application exception.
+      return true
+    }
+  }
   /** What decides whether a hit test lands on an element, as last styled
    *  (hittable: kept, as a drag hit-tests every move). */
   const hitStyles = new WeakMap<NativeElement, { display?: string | undefined; visibility?: string | undefined; pointer?: string | undefined }>()
@@ -467,10 +487,13 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     if (element.nativeId === 0) return
     restyled++
     const style = styleOf(element)
+    const paintOnly = element.isConnected && element.localName === 'div' && element.childNodes.length === 0 &&
+      nativeType(element) === 'div' && paintStyle(sentStyles.get(element), style)
     sentStyles.set(element, style)
     const base = info(element).declared.base
     hitStyles.set(element, { display: base.get('display'), visibility: base.get('visibility'), pointer: base.get('pointer-events') })
     mutations.setStyle(element.nativeId, style)
+    layoutBatch.style(paintOnly)
     // GPUI hit-tests an element with a hover or press style, and one that
     // paints a fill (a background or a shadow; Metal), hiding what's under
     // it from its own hit test: it has to say where the pointer went, as a
@@ -1976,6 +1999,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
     detach: (options: { windowGone?: boolean } = {}) => {
       if (detached) return
       detached = true
+      layoutBatch.reset()
       for (const timer of pendingEdits.values()) clearTimeout(timer)
       pendingEdits.clear()
       secrets?.dispose()
@@ -2006,6 +2030,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
           mutations.destroyElement(sentinel)
           mutations.destroyElement(root)
           mutations.flushMutations()
+          layoutBatch.reset()
         })
       }
       eventHandlers.clear()
