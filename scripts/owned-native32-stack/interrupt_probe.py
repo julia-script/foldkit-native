@@ -101,6 +101,10 @@ def probe(out, head):
                 evidence['nestedCleanup'] = nested_cleanup
                 manifest = json.loads((prep / 'manifest.json').read_text())
                 m.require(all(m.sha((prep / name).read_bytes()) == digest for name, digest in manifest.items()), 'interrupted manifest changed')
+                for name in manifest:
+                    if name.endswith('.json'):
+                        json.loads((prep / name).read_text())
+                m.require(not list(prep.rglob('*.pending-*')), 'receipt publication incomplete')
                 evidence['manifestEntriesVerified'] = len(manifest)
                 evidence['passed'] = True
             finally:

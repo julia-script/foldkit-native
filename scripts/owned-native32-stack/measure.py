@@ -49,9 +49,24 @@ def stamp():
 
 
 def save(out, name, value):
-    # Each immutable receipt has one writer; collisions cannot replace history.
-    with (out / (name + '.json')).open('x') as file:
-        json.dump(value, file, indent=2)
+    global DEFER_CANCELLATION
+    # Publish a fully written inode exclusively; readers never see partial JSON.
+    encoded = json.dumps(value, indent=2).encode()
+    final = out / (name + '.json')
+    if final.exists():
+        raise FileExistsError(final)
+    pending = out / (name + '.json.pending-' + str(os.getpid()))
+    previous = DEFER_CANCELLATION
+    DEFER_CANCELLATION = True
+    try:
+        with pending.open('xb') as file:
+            file.write(encoded)
+        os.link(pending, final)
+        pending.unlink()
+    finally:
+        DEFER_CANCELLATION = previous
+    if CANCELLATION_CHECK:
+        CANCELLATION_CHECK()
 
 
 def read_command(argv, cwd=ROOT):

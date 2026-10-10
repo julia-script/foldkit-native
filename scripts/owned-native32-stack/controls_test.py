@@ -277,6 +277,19 @@ class Controls(unittest.TestCase):
         self.assertIsNone(receipt['rawExit'])
         self.assertIn('inspection unavailable', receipt['cleanupError'])
 
+    def test_cancelled_receipt_publication_is_complete_and_exclusive(self):
+        self.out.mkdir()
+        value = {'rawExit': -15, 'cleanupVerified': True, 'signal': 15}
+        with patch.object(m, 'CANCELLATION_CHECK', side_effect=safe.Cancelled(15)):
+            with self.assertRaises(safe.Cancelled):
+                m.save(self.out, 'closed', value)
+        raw = (self.out / 'closed.json').read_bytes()
+        self.assertEqual(json.loads(raw), value)
+        self.assertFalse(list(self.out.glob('*.pending-*')))
+        with self.assertRaises(FileExistsError):
+            m.save(self.out, 'closed', {'wrong': 'replacement'})
+        self.assertEqual(raw, (self.out / 'closed.json').read_bytes())
+
     def test_raw_failure_pipeline_stays_failed_with_sampler_failure_and_manifest(self):
         class FakeChild:
             def __init__(self, argv, out, role, env):
