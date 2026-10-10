@@ -84,6 +84,73 @@ test('color-only batch preserves payload, geometry and age refresh while reducin
   expect(candidate.reads).toBe(0)
 })
 
+for (const change of ['ratio', 'remove', 'explicit height', 'reintroduce', 'unchanged'] as const) {
+  test(`settled aspect metadata preserves original fitting and invalidation: ${change}`, async () => {
+    const run = async (baseline: boolean) => {
+      const { app, cell } = make(baseline)
+      const cycles = async (count: number) => {
+        for (let i = 0; i < count; i++) {
+          await new Promise(resolve => setTimeout(resolve, 0))
+          app.host.frame(); app.host.flush(); app.host.drawn()
+        }
+      }
+      cell.setAttribute('style', `width:100px;aspect-ratio:1;background-color:${white}`)
+      app.host.flush()
+      app.gpui.setBounds(cell.nativeId, { x: 10, y: 10, width: 100, height: 100 })
+      await cycles(8)
+      expect(app.gpui.node(cell.nativeId).style['height']).toBe(100)
+      if (change === 'reintroduce') {
+        cell.setAttribute('style', `width:100px;height:100px;background-color:${white}`)
+        app.host.flush(); await cycles(8)
+      }
+      const next = change === 'ratio' || change === 'reintroduce' ? 'aspect-ratio:2'
+        : change === 'remove' || change === 'explicit height' ? 'height:100px'
+        : 'aspect-ratio:1'
+      const before = app.gpui.batches.length
+      const reads = app.host.geometry().reads
+      cell.setAttribute('style', `width:100px;${next}${change === 'explicit height' ? ';aspect-ratio:2' : ''};background-color:${white}`)
+      app.host.flush()
+      // Even a changed ratio initially sends the old fitted height.
+      expect(app.gpui.node(cell.nativeId).style['height']).toBe(100)
+      await cycles(4)
+      cell.getBoundingClientRect()
+      return { height: app.gpui.node(cell.nativeId).style['height'], commands: app.gpui.batches.slice(before), reads: app.host.geometry().reads - reads }
+    }
+    const original = await run(true)
+    const candidate = await run(false)
+    expect(candidate.height).toBe(original.height)
+    expect(candidate.height).toBe(change === 'ratio' || change === 'reintroduce' ? 50 : 100)
+    expect(candidate.commands).toEqual(original.commands)
+    if (change !== 'unchanged') expect(candidate.reads).toBeGreaterThan(0)
+    else expect(candidate.reads).toBe(0)
+  })
+}
+
+test('global aspect fallback rejects a cached height until the current ratio can be fitted', async () => {
+  const { app, cell, color } = make()
+  const other = app.document.createElement('div')
+  other.setAttribute('style', `width:100px;aspect-ratio:1;background-color:${white}`)
+  app.document.body.appendChild(other); app.host.flush()
+  app.gpui.setBounds(other.nativeId, { x: 100, y: 100, width: 100, height: 100 })
+  await app.settle(); await app.settle()
+  expect(app.gpui.node(other.nativeId).style['height']).toBe(100)
+  app.gpui.setBounds(other.nativeId, { x: 100, y: 100, width: 0, height: 100 })
+  app.host.relayout(); await app.settle(); await app.settle()
+  other.style.setProperty('aspect-ratio', '2'); app.host.flush()
+  await app.settle(); await app.settle()
+  expect(app.gpui.node(other.nativeId).style['height']).toBe(100)
+  let reads = app.host.geometry().reads
+  color(); await app.settle(); cell.getBoundingClientRect()
+  expect(app.host.geometry().reads).toBeGreaterThan(reads)
+  app.gpui.setBounds(other.nativeId, { x: 100, y: 100, width: 100, height: 100 })
+  app.host.relayout(); await app.settle(); await app.settle()
+  expect(app.gpui.node(other.nativeId).style['height']).toBe(50)
+  reads = app.host.geometry().reads
+  cell.style.setProperty('background-color', white); app.host.flush()
+  await app.settle(); cell.getBoundingClientRect()
+  expect(app.host.geometry().reads).toBe(reads)
+})
+
 for (const action of ['width removal', 'text', 'structure', 'listener', 'custom prop', 'reorder'] as const) {
   test(`unknown/mixed batch retains geometry invalidation: ${action}`, () => {
     const { app, cell, frame, color } = make()

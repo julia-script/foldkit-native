@@ -405,6 +405,8 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   // boxes paint), while the DOM, styles and events stay where they are.
   const aspects = new Map<NativeElement, number>()
   const aspectHeights = new WeakMap<NativeElement, number>()
+  // A cached height is resolved only for the ratio that produced it.
+  const fittedAspectRatios = new WeakMap<NativeElement, number>()
   /** After a frame, while the layout settles: each box with an aspect ratio
    *  whose width changed gets the height that width calls for. */
   const fitAspects = () => {
@@ -417,6 +419,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
       const box = boundsOf(element)
       if (box === null || box.width === 0) continue
       const height = Math.round((box.width / ratio) * 100) / 100
+      fittedAspectRatios.set(element, ratio)
       if (aspectHeights.get(element) === height) continue
       aspectHeights.set(element, height)
       dirty.add(element)
@@ -472,7 +475,7 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         if (!(node instanceof NativeElement) || !node.isConnected) continue
         if (nativeType(node) !== 'div' || node.getAttributeNames().some(name => name.startsWith('data-fn-'))) return true
         if (autonomousStyle(sentStyles.get(node))) return true
-        if (aspects.has(node) && !aspectHeights.has(node)) return true
+        if (aspects.has(node) && (!aspectHeights.has(node) || fittedAspectRatios.get(node) !== aspects.get(node))) return true
       }
       return false
     } catch {
@@ -486,9 +489,10 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
   const restyleTree = (element: NativeElement) => {
     if (element.nativeId === 0) return
     restyled++
+    const previousAspect = aspects.get(element)
     const style = styleOf(element)
     const paintOnly = element.isConnected && element.localName === 'div' && element.childNodes.length === 0 &&
-      nativeType(element) === 'div' && paintStyle(sentStyles.get(element), style)
+      nativeType(element) === 'div' && previousAspect === aspects.get(element) && paintStyle(sentStyles.get(element), style)
     sentStyles.set(element, style)
     const base = info(element).declared.base
     hitStyles.set(element, { display: base.get('display'), visibility: base.get('visibility'), pointer: base.get('pointer-events') })
