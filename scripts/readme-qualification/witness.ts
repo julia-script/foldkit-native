@@ -150,7 +150,7 @@ export function begin() {
       const point = hit(bounds, window)
       return { count, text, painted, tree, id, bounds, window, point, children: app!.document.body.childNodes.length, containerConnected: app!.container.isConnected, buttonConnected: buttons[0]!.isConnected, frames: renderer.getDebugFrameOverlayStats().frames }
     }
-    const control = process.env['QUALIFICATION_CASE'] === 'control'
+    const control = process.env['QUALIFICATION_CASE'] === 'control' || process.env['QUALIFICATION_CASE'] === 'corrected'
     const capture = (name: string) => {
       // The original capture/guard/error path stays exactly the same.
       const count = name === 'count-0' ? 0 : 1

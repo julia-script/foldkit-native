@@ -17,10 +17,10 @@ def control_source(snippet):
     return snippet.replace(MOUNT, MOUNT.replace('css })', 'css: css + ' + json.dumps(CSS) + ' })'))
 
 
-def validate_control(out):
+def validate_control(out, expected_case='control'):
     rows = json.loads((out / 'observations.json').read_text())
     initial = json.loads((out / 'initial-styles.json').read_text())
-    original.require(initial['case'] == 'control' and initial['pid'] == rows[0]['pid'], 'missing/wrong control styles')
+    original.require(expected_case in ('control', 'corrected') and initial['case'] == expected_case and initial['pid'] == rows[0]['pid'], 'missing/wrong control styles')
     shots = []
     for count, row in enumerate([rows[1], rows[3]]):
         before = json.loads((out / f'count-{count}-contrast-before.json').read_text())

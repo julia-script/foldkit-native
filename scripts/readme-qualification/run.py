@@ -12,10 +12,10 @@ import signal
 import subprocess
 import time
 
-HEAD = 'c4e4ced134f327c143d50dea3c03774fa28738d0'
-LOCK = '010dbbba16a62bc9d29b5f5a45ff48d3ae534e2ea9c011820978101562bdb4be'
-README = '5b84dc3cdd2cd1109e77cc376fa2e44b06e3450c28c240b672e346f34d6c5061'
-SNIPPET = '2a813a734e6d99fcd30d4d7288f5ef1aaf972a82a7901ce5421a068b174b649f'
+HEAD = '557ccb5ca6f201dcff6f2deb5cacc99c2b11b34f'
+LOCK = '93535904b69ec9f551e120066edca66d3488d5969f6b3c3fb464474a583181c8'
+README = 'ea385c1ae2db8d1dd6a1793397ddc70a6a4b4d4965a20ee24d9be6ef012861ec'
+SNIPPET = '0d3f6c723ab39237342b04f262e4c4fa19c59885f9252e8578e23aecc6ad81fb'
 HERE = Path(__file__).resolve().parent
 PINS = {'foldkit': '0.165.0', '@foldkit/ui': '0.165.0', 'effect': '4.0.0', '@gpuix/native': '0.10.0',
         'happy-dom': '20.14.5', '@gpuix/native-darwin-arm64': '0.10.0'}
@@ -137,7 +137,7 @@ def driver_source(out=None, phase='before'):
         except OSError:
             pass  # An evidence write failure must not replace the original guard rejection.
     require(not clean and head == os.environ.get('GITHUB_SHA'), 'runner is not the clean reviewed event head')
-    files = [root / '.github/workflows/hosted-readme-qualification.yml', root / '.github/workflows/hosted-readme-contrast-qualification.yml', *HERE.glob('*.py'), *HERE.glob('*.ts'), *HERE.glob('*.swift')]
+    files = [root / '.github/workflows/hosted-readme-qualification.yml', root / '.github/workflows/hosted-readme-contrast-qualification.yml', root / '.github/workflows/hosted-readme-corrected-qualification.yml', *HERE.glob('*.py'), *HERE.glob('*.ts'), *HERE.glob('*.swift')]
     return {'head': head, 'clean': clean, 'files': {str(path.relative_to(root)): sha(path.read_bytes()) for path in files}}
 
 
@@ -193,7 +193,7 @@ def run(root, out, case='original'):
     probe_identity = None
     save(out, 'result', result)
     try:
-        require(case in ('original', 'control'), 'unknown qualification case')
+        require(case in ('original', 'control', 'corrected'), 'unknown qualification case')
         require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'requires real macOS Apple silicon host')
         require('FOLDKIT_NATIVE_NO_WINDOW' not in os.environ, 'headless mode forbidden')
         require('NAPI_RS_NATIVE_LIBRARY_PATH' not in os.environ, 'alternate native binding forbidden')
@@ -216,17 +216,18 @@ def run(root, out, case='original'):
         require(pins == PINS and all(info['name'] == name for name, info in dependencies['packages'].items()), 'dependency pins/identities differ')
         result['pins'] = pins
         save(out, 'native-binary', dependencies['binary'])
-        if case == 'control':
+        if case in ('control', 'corrected'):
             probe = out / 'macos-frame'
             command(['swiftc', str(HERE / 'macos-frame.swift'), '-o', str(probe)], root, env, out, 'compile-frame-probe', 60)
             probe_identity = sha(probe.read_bytes())
             save(out, 'frame-probe', {'sourceSHA256': sha((HERE / 'macos-frame.swift').read_bytes()), 'binarySHA256': probe_identity})
             env['QUALIFICATION_FRAME_PROBE'] = str(probe)
-            from contrast_run import control_source
-            snippet = control_source(snippet)
-            (out / 'control-snippet.ts').write_text(snippet)
+            if case == 'control':
+                from contrast_run import control_source
+                snippet = control_source(snippet)
+                (out / 'control-snippet.ts').write_text(snippet)
         # Eval runs from the documented repository root, using its exact tsconfig
-        # and imports. Only the original case is verbatim; the independently
+        # and imports. Original and corrected cases are verbatim; the separately
         # labeled control changes the css option and saves its own source/hash.
         evaluation = f'import {{ begin as qualificationBegin }} from {json.dumps(str(HERE / "witness.ts"))};\nconst qualificationObserve = qualificationBegin();\n' + snippet + '\nawait qualificationObserve(app);\n'
         (out / 'executed-source.ts').write_text(evaluation)
@@ -235,9 +236,9 @@ def run(root, out, case='original'):
         command(['bun', '--eval', evaluation], root, env, out, 'native-readme', 45)
         result['phase'] = 'acceptance'
         validate(out)
-        if case == 'control':
+        if case in ('control', 'corrected'):
             from contrast_run import validate_control
-            validate_control(out)
+            validate_control(out, case)
         result['status'] = 'passed'
     except BaseException as error:
         result['error'] = repr(error)
