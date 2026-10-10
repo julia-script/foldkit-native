@@ -226,7 +226,8 @@ class Controls(unittest.TestCase):
                  patch.object(m, 'source_identity', return_value=source), patch.object(m, 'dependency_identity', return_value=deps), \
                  patch.object(m, 'read_command', side_effect=lambda argv: '1.3.9' if argv[0] == 'bun' else 'v22.22.3' if argv[0] == 'node' else 'synthetic nm'), \
                  patch.object(m, 'Owned', FakeChild):
-                self.assertEqual(m.run(out), 17 if original_exit else 1)
+                actual_exit = m.run(out)
+                self.assertEqual(actual_exit, 17 if original_exit else 1, (out / 'result.json').read_text())
             result = json.loads((out / 'result.json').read_text())
             self.assertEqual(result['originalRawExit'], original_exit)
             self.assertEqual(result['samplerRawExit'], sampler_exit)
