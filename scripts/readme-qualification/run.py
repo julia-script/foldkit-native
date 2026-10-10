@@ -15,6 +15,8 @@ LOCK = '010dbbba16a62bc9d29b5f5a45ff48d3ae534e2ea9c011820978101562bdb4be'
 README = '5b84dc3cdd2cd1109e77cc376fa2e44b06e3450c28c240b672e346f34d6c5061'
 SNIPPET = '2a813a734e6d99fcd30d4d7288f5ef1aaf972a82a7901ce5421a068b174b649f'
 HERE = Path(__file__).resolve().parent
+PINS = {'foldkit': '0.165.0', '@foldkit/ui': '0.165.0', 'effect': '4.0.0', '@gpuix/native': '0.10.0',
+        'happy-dom': '20.14.5', '@gpuix/native-darwin-arm64': '0.10.0'}
 
 
 def require(condition, reason):
@@ -129,6 +131,19 @@ def driver_source():
     return {'head': head, 'clean': clean, 'files': {str(path.relative_to(root)): sha(path.read_bytes()) for path in files}}
 
 
+def dependency_identity(root):
+    packages = {}
+    for name in PINS:
+        raw = (root / 'node_modules' / name / 'package.json').read_bytes()
+        info = json.loads(raw)
+        packages[name] = {'name': info['name'], 'version': info['version'], 'packageSHA256': sha(raw)}
+    binaries = list((root / 'node_modules/@gpuix/native-darwin-arm64').glob('*.node'))
+    require(len(binaries) == 1, 'missing/ambiguous native platform binary')
+    native = packages['@gpuix/native-darwin-arm64']
+    return {'packages': packages, 'binary': {'package': native['name'], 'version': native['version'],
+            'file': binaries[0].name, 'sha256': sha(binaries[0].read_bytes())}}
+
+
 def validate(out):
     rows = json.loads((out / 'observations.json').read_text())
     require([r['kind'] for r in rows] == ['startup', 'before', 'input', 'after', 'close-request', 'exit'], 'missing/extra/skipped native stages')
@@ -163,6 +178,7 @@ def run(root, out):
     result = {'status': 'failed', 'phase': 'preflight', 'head': HEAD, 'started': time.time(),
               'host': {'system': platform.system(), 'machine': platform.machine()}, 'error': None}
     driver = None
+    dependencies = None
     save(out, 'result', result)
     try:
         require(platform.system() == 'Darwin' and platform.machine() == 'arm64', 'requires real macOS Apple silicon host')
@@ -181,15 +197,12 @@ def run(root, out):
         require(result['node'] == 'v22.22.3' and result['bun'] == '1.3.9', 'runtime pins differ')
         result['phase'] = 'dependencies'
         command(['npm', 'ci'], root, env, out, 'npm-ci', 180)
-        pins = {name: json.loads((root / 'node_modules' / name / 'package.json').read_text())['version'] for name in ('foldkit', '@foldkit/ui', 'effect', '@gpuix/native', 'happy-dom')}
-        require(pins == {'foldkit': '0.165.0', '@foldkit/ui': '0.165.0', 'effect': '4.0.0', '@gpuix/native': '0.10.0', 'happy-dom': '20.14.5'}, 'dependency pins differ')
+        dependencies = dependency_identity(root)
+        save(out, 'dependencies-before', dependencies)
+        pins = {name: info['version'] for name, info in dependencies['packages'].items()}
+        require(pins == PINS and all(info['name'] == name for name, info in dependencies['packages'].items()), 'dependency pins/identities differ')
         result['pins'] = pins
-        binary_package = root / 'node_modules/@gpuix/native-darwin-arm64'
-        binary_info = json.loads((binary_package / 'package.json').read_text())
-        require(binary_info['version'] == '0.10.0', 'native platform package pin differs')
-        binaries = list(binary_package.glob('*.node'))
-        require(len(binaries) == 1, 'missing/ambiguous native platform binary')
-        save(out, 'native-binary', {'package': binary_info['name'], 'version': binary_info['version'], 'file': binaries[0].name, 'sha256': sha(binaries[0].read_bytes())})
+        save(out, 'native-binary', dependencies['binary'])
         # Eval runs from the documented repository root, using its exact tsconfig
         # and imports. The snippet itself is preserved byte-for-byte and contiguous.
         evaluation = f'import {{ begin as qualificationBegin }} from {json.dumps(str(HERE / "witness.ts"))};\nconst qualificationObserve = qualificationBegin();\n' + snippet + '\nawait qualificationObserve(app);\n'
@@ -213,11 +226,22 @@ def run(root, out):
         except BaseException as error:
             result['status'] = 'failed'
             result['sourceError'] = repr(error)
+        # Check installed inputs even when source revalidation or execution failed.
+        if dependencies is not None:
+            try:
+                after_dependencies = dependency_identity(root)
+                save(out, 'dependencies-after', after_dependencies)
+                save(out, 'native-binary-after', after_dependencies['binary'])
+                require(after_dependencies == dependencies, 'dependency/native binary identity changed during execution')
+            except BaseException as error:
+                result['status'] = 'failed'
+                result['dependencyError'] = repr(error)
+                save(out, 'dependencies-after-failure', {'error': repr(error)})
         result['finished'] = time.time()
         save(out, 'result', result)
         manifest = {str(path.relative_to(out)): sha(path.read_bytes()) for path in out.rglob('*') if path.is_file() and path.name != 'manifest.json'}
         save(out, 'manifest', manifest)
-    require(result['status'] == 'passed', 'final source identity failed')
+    require(result['status'] == 'passed', 'final source/dependency identity failed')
 
 
 if __name__ == '__main__':

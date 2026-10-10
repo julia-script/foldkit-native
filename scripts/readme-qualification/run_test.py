@@ -154,6 +154,66 @@ class Acceptance(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'source absent'):
                 runner.source(self.out)
 
+    def mocked_execution(self, mutation=None):
+        # Retain the REAL run()/validate()/identity/finally path; only host,
+        # command execution and immutable repo reads are replaced. No Bun/GPUI.
+        with tempfile.TemporaryDirectory() as directory:
+            root, out = Path(directory) / 'target', Path(directory) / 'evidence'
+            for name, version in runner.PINS.items():
+                path = root / 'node_modules' / name / 'package.json'
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps({'name': name, 'version': version}))
+            binary = root / 'node_modules/@gpuix/native-darwin-arm64/gpuix.node'
+            binary.write_bytes(b'mocked native binary; never loaded')
+            def command(argv, _cwd, _env, destination, name, _timeout):
+                if name == 'node-version':
+                    return 'v22.22.3'
+                if name == 'bun-version':
+                    return '1.3.9'
+                if name == 'native-readme':
+                    runner.save(destination, 'observations', self.rows)
+                    runner.save(destination, 'native-readme', self.child)
+                    for count in [0, 1]:
+                        (destination / f'count-{count}.png').write_bytes((self.out / f'count-{count}.png').read_bytes())
+                    if mutation:
+                        mutation(root, binary)
+                return ''
+            with patch.object(runner.platform, 'system', return_value='Darwin'), patch.object(runner.platform, 'machine', return_value='arm64'), patch.object(runner, 'source', return_value=({'head': runner.HEAD}, '// exact source is mocked for this fault control')), patch.object(runner, 'driver_source', return_value={'head': 'mock-driver'}), patch.object(runner, 'command', side_effect=command), patch.dict(os.environ, {}, clear=True):
+                if mutation:
+                    with self.assertRaisesRegex(RuntimeError, 'source/dependency identity'):
+                        runner.run(root, out)
+                else:
+                    runner.run(root, out)
+            result = json.loads((out / 'result.json').read_text())
+            before = json.loads((out / 'dependencies-before.json').read_text())
+            if mutation:
+                self.assertEqual(result['status'], 'failed')
+                self.assertIn('dependencyError', result)
+                self.assertTrue((out / 'dependencies-after-failure.json').exists())
+                self.assertIn('dependencies-after-failure.json', json.loads((out / 'manifest.json').read_text()))
+            else:
+                self.assertEqual(result['status'], 'passed')
+                self.assertEqual(before, json.loads((out / 'dependencies-after.json').read_text()))
+                self.assertEqual(json.loads((out / 'native-binary.json').read_text()), json.loads((out / 'native-binary-after.json').read_text()))
+            return result
+
+    def test_unchanged_installed_inputs_pass_real_acceptance_path(self):
+        self.mocked_execution()
+
+    def test_binary_drift_and_disappearance_fail_after_successful_mock_execution(self):
+        for mutation in [lambda _root, binary: binary.write_bytes(b'changed native binary'), lambda _root, binary: binary.unlink()]:
+            with self.subTest(mutation=mutation):
+                self.mocked_execution(mutation)
+
+    def test_dependency_drift_and_disappearance_fail_after_successful_mock_execution(self):
+        def change_version(root, _binary):
+            (root / 'node_modules/effect/package.json').write_text(json.dumps({'name': 'effect', 'version': '4.0.1'}))
+        def change_same_version_identity(root, _binary):
+            (root / 'node_modules/effect/package.json').write_text(json.dumps({'name': 'effect', 'version': '4.0.0', 'changed': True}))
+        for mutation in [change_version, change_same_version_identity, lambda root, _binary: (root / 'node_modules/effect/package.json').unlink()]:
+            with self.subTest(mutation=mutation):
+                self.mocked_execution(mutation)
+
 
 if __name__ == '__main__':
     unittest.main()
