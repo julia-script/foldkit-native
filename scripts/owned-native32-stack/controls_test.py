@@ -173,6 +173,7 @@ class Controls(unittest.TestCase):
             receipt = child.close()
             m.save(self.out, program + '-process', receipt)
             self.assertEqual(receipt['rawExit'], expected)
+            self.assertIsNotNone(receipt['identity'], receipt)
             self.assertTrue(receipt['cleanupVerified'], receipt)
             self.assertFalse(receipt['survivors'])
 
@@ -187,6 +188,7 @@ class Controls(unittest.TestCase):
                 receipt = child.close()
                 m.save(self.out, program + '-process', receipt)
             self.assertEqual(receipt['rawExit'], -15)
+            self.assertIsNotNone(receipt['identity'], receipt)
             self.assertTrue(receipt['cleanupVerified'], receipt)
             self.assertFalse(receipt['survivors'])
             self.assertIn('SIGTERM', receipt['signals'])

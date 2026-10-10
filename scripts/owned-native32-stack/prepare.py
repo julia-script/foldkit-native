@@ -14,7 +14,7 @@ import measure as m
 
 SAFE_PROGRAMS = {
     'success': 'import time; print("harmless-owned",flush=True); time.sleep(.15)',
-    'failure': 'raise SystemExit(17)',
+    'failure': 'import time; time.sleep(.15); raise SystemExit(17)',
     'hang': 'import time; time.sleep(20)',
     'descendant': 'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"]); print("owned-descendant",flush=True); time.sleep(20)',
 }
