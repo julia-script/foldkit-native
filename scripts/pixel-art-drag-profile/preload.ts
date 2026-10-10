@@ -15,13 +15,14 @@ let realBacking = false
 const testing = await import('@gpuix/native/testing')
 if (!testing.hasNativeTestRenderer) throw new Error('real native TestRenderer unavailable')
 const Constructor = testing.TestRenderer
+const { TestGpuixRenderer } = await import('@gpuix/native')
 const ObservedRenderer = new Proxy(Constructor, {
   construct(target, args) {
     // Reflect constructs the ORIGINAL class, with its original prototype and
     // native constructor; this neither subclasses nor substitutes a renderer.
     const instance = Reflect.construct(target, args, target)
     instances++
-    realBacking = instance instanceof Constructor && Object.getPrototypeOf(instance) === Constructor.prototype && Reflect.get(instance, 'native')?.constructor?.name === 'TestGpuixRenderer'
+    realBacking = instance instanceof Constructor && Object.getPrototypeOf(instance) === Constructor.prototype && Reflect.get(instance, 'native') instanceof TestGpuixRenderer
     observer.requested(args[0])
     observer.instrumentRenderer(instance)
     return instance
