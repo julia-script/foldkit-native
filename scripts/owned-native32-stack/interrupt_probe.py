@@ -70,16 +70,26 @@ def probe(out, head):
                                 break
                     time.sleep(.005)
                 m.require('targetBefore' in evidence, 'required active harmless stage not observed; no signal')
-                child.verified_live()
+                rows = m.table()
+                root = rows.get(child.child.pid)
+                target = rows.get(evidence['targetBefore']['pid'])
+                m.require(child.child.poll() is None and root and m.token(root) == m.token(child.receipt['identity']), 'stale supervisor at signal delivery')
+                m.require(target and not target['state'].startswith('Z')
+                          and m.token(target) == m.token(evidence['targetBefore']), 'harmless target no longer active at delivery')
+                evidence['deliverySnapshot'] = {'supervisor': root, 'target': target, 'observed': m.stamp()}
                 m.save(case, 'before-signal', evidence)
-                child.send(signal.SIGTERM)
+                os.kill(child.child.pid, signal.SIGTERM)
+                child.receipt['signals'].append('SIGTERM')
+                evidence['signalDelivery'] = {'kind': 'exact owned PID', 'pid': child.child.pid, 'delivered': m.stamp()}
                 child.child.wait(timeout=20)
                 evidence['supervisorRawExit'] = child.child.returncode
                 m.require(child.child.returncode == 143, 'cancelled supervisor raw exit not preserved')
                 saved = json.loads((prep / 'result.json').read_text())
                 m.require(saved['interruptSignal'] == 15 and 'Cancelled' in saved['error'], 'interruption receipt missing')
                 step = json.loads((prep / 'controls-process.json').read_text())
-                m.require(step['rawExit'] in (143, -15) and step['cleanupVerified'], 'control raw exit/cleanup not preserved')
+                # A step can finish naturally while supervisor cleanup starts.
+                # Preserve raw0 instead of fabricating a signal-induced exit.
+                m.require(step['rawExit'] in (0, 143, -15) and step['cleanupVerified'], 'control raw exit/cleanup not preserved')
                 nested_cleanup = json.loads((prep / 'controls-nested-cleanup.json').read_text())
                 m.require(nested_cleanup['cleanupVerified'] and nested_cleanup['survivors'] == [], 'nested cleanup unverified')
                 rows = m.table()

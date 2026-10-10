@@ -119,7 +119,7 @@ class Owned:
         self.role, self.known, self.child = role, {}, None
         self.out, self.closed = out, False
         self.receipt = {'role': role, 'argv': argv, 'start': stamp(), 'rawExit': None,
-                        'signals': [], 'cleanupVerified': False, 'survivors': [], 'identity': None}
+                        'signals': [], 'cleanupVerified': False, 'survivors': None, 'identity': None}
         if CANCELLATION_CHECK:
             CANCELLATION_CHECK()
         self.stdout = (out / (role + '.stdout.log')).open('x')

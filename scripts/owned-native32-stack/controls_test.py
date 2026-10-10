@@ -1,6 +1,7 @@
 """Audited synthetic receipts and harmless owned Python children; no native load."""
 import copy
 import datetime as dt
+import io
 import json
 import os
 from pathlib import Path
@@ -261,6 +262,20 @@ class Controls(unittest.TestCase):
         self.assertNotIn(child, m.ACTIVE_OWNED)
         self.assertTrue(first['cleanupVerified'])
         m.save(self.out, 'idempotent-process', first)
+
+    def test_owned_inspection_failure_does_not_acknowledge_empty_cleanup(self):
+        child = object.__new__(m.Owned)
+        child.closed = False
+        child.child = type('Child', (), {'pid': 99991, 'returncode': None, 'poll': lambda self: None})()
+        child.stdout, child.stderr = io.StringIO(), io.StringIO()
+        child.receipt = {'rawExit': None, 'cleanupVerified': False, 'survivors': None, 'signals': []}
+        with patch.object(m, 'table', side_effect=OSError('inspection unavailable')), patch.object(os, 'killpg') as kill:
+            receipt = child.close()
+            kill.assert_not_called()
+        self.assertFalse(receipt['cleanupVerified'])
+        self.assertIsNone(receipt['survivors'])
+        self.assertIsNone(receipt['rawExit'])
+        self.assertIn('inspection unavailable', receipt['cleanupError'])
 
     def test_raw_failure_pipeline_stays_failed_with_sampler_failure_and_manifest(self):
         class FakeChild:
