@@ -30,6 +30,7 @@ LIMITS = {'originalEnvelopeSeconds': 60, 'sampleSeconds': 25, 'sampleIntervalMil
           'phaseUncertainty': 'Window log precedes attach; no immutable drag-start marker. Startup, resize and drag may overlap.',
           'overhead': 'sample suspends/resumes the target; its overhead can perturb the unchanged 30-second deadline.',
           'interpretation': 'Inclusive sampled occupancy only; not exclusive CPU, paint count, speedup or causal attribution.'}
+MAPPER_SECONDS = 5
 ACTIVE_OWNED = []
 DEFER_CANCELLATION = False
 CANCELLATION_CHECK = None
@@ -276,6 +277,86 @@ def sample_command(target, out):
     return ['/usr/bin/sample', str(target.child.pid), '25', '10', '-mayDie', '-file', str(out / 'sample.txt')]
 
 
+def fresh_target(target):
+    initial = target.verified_live()
+    current = target.receipt['lastResources']
+    require(token(current) == token(initial) and current['ppid'] == os.getpid()
+            and current['pid'] == target.child.pid == current['pgid']
+            and Path(current['command']).name == 'bun' and not current['state'].startswith('Z'),
+            'mapper target identity/parent/session/executable differs')
+    return dict(current)
+
+
+def mapper_command(target):
+    return ['/usr/bin/vmmap', '-w', '-interleaved', str(fresh_target(target)['pid'])]
+
+
+def image_diagnostics(raw, binary):
+    section = raw.split('Binary Images:', 1)[1] if 'Binary Images:' in raw else ''
+    candidates = []
+    for line in section.splitlines():
+        match = re.fullmatch(r'\s*(0x[0-9a-fA-F]+)\s*-\s*(0x[0-9a-fA-F]+)\s+\+?'
+                             r'gpuix-native\.darwin-arm64\.node(?:\s+\([^\r\n]*?\))?'
+                             r'\s+<([0-9A-Fa-f-]{36})>\s+(.+)', line)
+        if match:
+            candidates.append({'raw': line, 'start': int(match[1], 16), 'end': int(match[2], 16),
+                               'uuid': match[3].upper(), 'path': match[4]})
+    return {'nativeRows': candidates, 'nativeRowCount': len(candidates),
+            'matchingUUIDCount': sum(r['uuid'] == binary['uuid'] for r in candidates),
+            'exactPathCount': sum(r['path'] == binary['path'] for r in candidates),
+            'redactedPathCount': sum('*' in r['path'] for r in candidates),
+            'interpretation': 'Diagnostic counts only; no wildcard alias or acceptance.'}
+
+
+def mapped_text(raw, pid, binary):
+    headers = re.findall(r'^Process:\s+(.+?)\s*$', raw, re.M)
+    require(headers == ['bun [' + str(pid) + ']'], 'mapper header PID/name differs/ambiguous')
+    candidates = []
+    for line in raw.splitlines():
+        if not line.lstrip().startswith('__TEXT ') or 'gpuix-native.darwin-arm64.node' not in line:
+            continue
+        match = re.fullmatch(r'\s*__TEXT\s+([0-9a-fA-F]+)-([0-9a-fA-F]+)\s+\[[^\]\r\n]+\]'
+                             r'\s+([rwx-]{3})/([rwx-]{3})\s+SM=COW\s+(.+?)\s*', line)
+        require(match is not None, 'unsupported native mapped-region format')
+        candidates.append({'raw': line, 'start': int(match[1], 16), 'end': int(match[2], 16),
+                           'currentProtection': match[3], 'maximumProtection': match[4], 'path': match[5]})
+    require(len(candidates) == 1, 'missing/ambiguous native mapped region')
+    region = candidates[0]
+    require(Path(region['path']).is_absolute() and '*' not in region['path'] and region['path'] == binary['path'],
+            'mapped runtime path unavailable/different')
+    require(region['start'] < region['end'] and region['currentProtection'] == 'r-x'
+            and region['maximumProtection'] in ('r-x', 'rwx'), 'invalid mapped interval/protection')
+    return region
+
+
+def validate_mapping(raw, mapper, original, sampler, binary, image):
+    pid = original['identity']['pid']
+    require(mapper['role'] == 'mapper' and mapper['rawExit'] == 0 and mapper['cleanupVerified']
+            and mapper['survivors'] == [] and not mapper.get('signals'), 'mapper raw outcome/cleanup incomplete')
+    require(mapper['argv'] == ['/usr/bin/vmmap', '-w', '-interleaved', str(pid)], 'mapper argv/PID differs')
+    own = mapper['identity']
+    require(own and own['pid'] != pid and own['pgid'] == own['pid'] and own['ppid'] == original['identity']['ppid']
+            and own['start'] and own['command'] == '/usr/bin/vmmap', 'mapper owned identity/session differs')
+    for key in ('targetBefore', 'targetAfter'):
+        observed = mapper[key]
+        require(token(observed) == token(original['identity']) == sampler['targetIdentity']
+                and observed['ppid'] == original['identity']['ppid'] and observed['pgid'] == pid
+                and not observed['state'].startswith('Z'), 'stale mapper original target identity')
+    target = sampler['targetAtStart']
+    require(token(target) == token(original['identity']) and target['ppid'] == original['identity']['ppid']
+            and not target['state'].startswith('Z'), 'stale pre-sample target identity')
+    times = [mapper['targetBeforeObserved'], mapper['start'], mapper['end'], mapper['targetAfterObserved'], sampler['start']]
+    utc = [dt.datetime.fromisoformat(t['utc']).timestamp() for t in times]
+    monotonic = [t['monotonic'] for t in times]
+    require(utc == sorted(utc) and monotonic == sorted(monotonic)
+            and 0 <= monotonic[2] - monotonic[1] <= MAPPER_SECONDS, 'mapper interval/order/cap differs')
+    region = mapped_text(raw, pid, binary)
+    require(image['start'] < image['end'] and region['start'] == image['start'], 'mapped __TEXT/sample image load base differs')
+    return {'region': region, 'mapperIdentity': own, 'targetIdentity': sampler['targetIdentity'],
+            'interval': [mapper['start'], mapper['end']],
+            'limits': 'Point-in-time mapping, not uninterrupted residency or in-memory bytes; __TEXT end is not whole-image end.'}
+
+
 def marker(raw):
     matches = re.findall(r'^native test window: (\{[^\n]*\})\s*$', raw, re.M)
     if not matches:
@@ -286,7 +367,7 @@ def marker(raw):
     return packet
 
 
-def validate_report(raw, original, sampler, binary, synthetic=False):
+def validate_report(raw, original, sampler, binary, synthetic=False, mapper=None, map_raw=None):
     require(not synthetic, 'synthetic report cannot establish physical stack evidence')
     require(sampler['rawExit'] == 0 and sampler['cleanupVerified'], 'sample command failed or cleanup unverified')
     pid = original['identity']['pid']
@@ -302,8 +383,18 @@ def validate_report(raw, original, sampler, binary, synthetic=False):
         if frame and int(frame[1]) > 0:
             positive_frames.append((line, frame[2]))
     require(positive_frames, 'empty/malformed stack tree: no positive image-linked frames')
-    image = [line for line in raw.split('Binary Images:', 1)[1].splitlines() if line.rstrip().endswith(binary['path'])]
-    require(len(image) == 1 and '<' + binary['uuid'] + '>' in image[0].upper(), 'loaded-image UUID/path differs from hashed installed binary')
+    diagnostic = image_diagnostics(raw, binary)
+    require(diagnostic['nativeRowCount'] == 1 and diagnostic['matchingUUIDCount'] == 1,
+            'loaded-image UUID missing/different/ambiguous')
+    image = diagnostic['nativeRows'][0]
+    require(image['start'] < image['end'], 'invalid sample image interval')
+    bridge = None
+    if mapper is not None or map_raw is not None:
+        require(mapper is not None and map_raw is not None, 'incomplete owned map evidence')
+        require(image['path'] in (binary['path'], '/Users/*/gpuix-native.darwin-arm64.node'), 'unsupported/different image path')
+        bridge = validate_mapping(map_raw, mapper, original, sampler, binary, image)
+    else:
+        require(image['path'] == binary['path'], 'loaded-image runtime path unavailable/different; owned map required')
     require(binary['sha256'] == NATIVE_SHA, 'report linkage has wrong installed binary hash')
     date = re.search(r'^Date/Time:\s+(.+)$', raw, re.M)
     require(date is not None, 'sample date missing')
@@ -311,10 +402,10 @@ def validate_report(raw, original, sampler, binary, synthetic=False):
     first = dt.datetime.fromisoformat(sampler['start']['utc']).timestamp()
     last = dt.datetime.fromisoformat(sampler['end']['utc']).timestamp()
     require(first - 1 <= when <= last + 1, 'stale report timestamp outside owned sampling interval')
-    image_name = re.match(r'\s*0x[0-9a-f]+\s*-\s*0x[0-9a-f]+\s+\+?(\S+)', image[0], re.I)
+    image_name = re.match(r'\s*0x[0-9a-f]+\s*-\s*0x[0-9a-f]+\s+\+?(\S+)', image['raw'], re.I)
     require(image_name is not None, 'malformed loaded-image address/name')
     frames = [line for line, name in positive_frames if name == image_name[1]]
-    return {'reportPID': pid, 'loadedImage': image[0], 'installedBinary': binary,
+    return {'reportPID': pid, 'loadedImage': image['raw'], 'installedBinary': binary, 'imageDiagnostics': diagnostic, 'ownedMapBridge': bridge,
             'nativeImageFrameLines': frames, 'symbolAttributionAvailable': bool(frames),
             'samplingInterval': [sampler['start'], sampler['end']], 'phaseUncertainty': LIMITS['phaseUncertainty'],
             'interpretation': LIMITS['interpretation'], 'attribution': 'Only this matching binary image; no source-tag build attestation.'}
@@ -337,9 +428,9 @@ def run(out):
     require(not out.is_relative_to(ROOT), 'evidence must be outside frozen checkout')
     out.mkdir(parents=True, exist_ok=False)
     state = {'completeEvidence': False, 'originalVerdict': 'unproved', 'originalRawExit': None,
-             'samplerRawExit': None, 'synthetic': False, 'limits': LIMITS, 'start': stamp()}
-    original = sampler = None
-    source = deps = None
+             'samplerRawExit': None, 'mapperRawExit': None, 'synthetic': False, 'limits': LIMITS, 'mapperSeconds': MAPPER_SECONDS, 'start': stamp()}
+    original = sampler = mapper = None
+    source = deps = mapper_tool = None
     try:
         require(os.environ.get('GITHUB_ACTIONS') == 'true' and os.uname().sysname == 'Darwin'
                 and os.environ.get('GITHUB_REPOSITORY') == 'julia-script/foldkit-native'
@@ -356,7 +447,8 @@ def run(out):
         (out / 'native-symbols.log').write_text(symbols)
         save(out, 'symbols', {'binary': deps['binary'], 'nmSHA256': sha(symbols.encode()),
              'interpretation': 'Local installed symbols; not upstream tag/build attestation or observed calls.'})
-        save(out, 'planned-command', {'original': ORIGINAL, 'samplerTemplate': ['/usr/bin/sample', 'OWNED_PID', '25', '10', '-mayDie', '-file', 'EXCLUSIVE_OUTPUT'], 'limits': LIMITS})
+        save(out, 'planned-command', {'original': ORIGINAL, 'samplerTemplate': ['/usr/bin/sample', 'OWNED_PID', '25', '10', '-mayDie', '-file', 'EXCLUSIVE_OUTPUT'],
+             'mapperTemplate': ['/usr/bin/vmmap', '-w', '-interleaved', 'OWNED_PID'], 'mapperSeconds': MAPPER_SECONDS, 'limits': LIMITS})
         (out / 'native').mkdir()
         env = {**os.environ, 'FOLDKIT_NATIVE_RENDERER': 'gpuix', 'FOLDKIT_NATIVE_EVIDENCE': str(out / 'native'), 'PYTHONDONTWRITEBYTECODE': '1'}
         original = Owned(ORIGINAL, out, 'original', env)
@@ -376,10 +468,40 @@ def run(out):
                 found = marker((out / 'original.stdout.log').read_text(errors='replace') + (out / 'original.stderr.log').read_text(errors='replace'))
                 if found:
                     save(out, 'marker-observed', {'observed': stamp(), 'marker': found, 'limits': LIMITS})
+                    before = fresh_target(original)
+                    before_observed = stamp()
+                    save(out, 'target-before-map', {'identity': before, 'observed': before_observed})
+                    mapper_tool = {'path': '/usr/bin/vmmap', 'sha256': sha(Path('/usr/bin/vmmap').read_bytes())}
+                    save(out, 'mapper-tool-before', mapper_tool)
+                    mapper = Owned(mapper_command(original), out, 'mapper', env)
+                    mapper.receipt['targetBefore'] = before
+                    mapper.receipt['targetBeforeObserved'] = before_observed
+                    while mapper.child.poll() is None:
+                        moment = time.monotonic()
+                        if moment - start > LIMITS['originalEnvelopeSeconds']:
+                            state['originalEnvelopeExceeded'] = True
+                            raise TimeoutError('original envelope exceeded during mapping')
+                        if moment - mapper.receipt['start']['monotonic'] > MAPPER_SECONDS:
+                            state['mapperEnvelopeExceeded'] = True
+                            raise TimeoutError('mapper five-second cap exceeded')
+                        fresh_target(original)
+                        mapper.observe()
+                        time.sleep(.02)
+                    mapped = mapper.close()
+                    require(mapped['rawExit'] == 0 and mapped['cleanupVerified'] and mapped['survivors'] == [], 'mapper failed or cleanup unverified')
+                    require(time.monotonic() - mapped['start']['monotonic'] <= MAPPER_SECONDS, 'mapper five-second cap exceeded')
+                    mapper.receipt['targetAfter'] = fresh_target(original)
+                    mapper.receipt['targetAfterObserved'] = stamp()
+                    save(out, 'target-after-map', {'identity': mapper.receipt['targetAfter'], 'observed': mapper.receipt['targetAfterObserved']})
+                    mapped_text((out / 'mapper.stdout.log').read_text(), original.child.pid, deps['binary'])
+                    require(time.monotonic() - start <= LIMITS['originalEnvelopeSeconds'], 'original envelope exceeded after mapping')
                     argv = sample_command(original, out)
-                    save(out, 'target-at-sample-start', original.verified_live())
+                    target_at_start = fresh_target(original)
+                    save(out, 'target-at-sample-start', target_at_start)
                     sampler = Owned(argv, out, 'sampler', env)
                     sampler.receipt['targetIdentity'] = token(original.receipt['identity'])
+                    sampler.receipt['targetAtStart'] = target_at_start
+                    now = time.monotonic()
             if sampler and sampler.child.poll() is None and now - sampler.receipt['start']['monotonic'] > LIMITS['samplerEnvelopeSeconds']:
                 state['samplerEnvelopeExceeded'] = True
                 raise TimeoutError('sampler envelope exceeded')
@@ -393,11 +515,11 @@ def run(out):
         previous = DEFER_CANCELLATION
         DEFER_CANCELLATION = True
         try:
-            for child in (sampler, original):
+            for child in (mapper, sampler, original):
                 if child:
                     receipt = child.close()
                     save(out, child.role + '-process', receipt)
-            for role, child in (('original', original), ('sampler', sampler)):
+            for role, child in (('original', original), ('sampler', sampler), ('mapper', mapper)):
                 failed = out / (role + '-process.json')
                 receipt = child.receipt if child else json.loads(failed.read_text()) if failed.exists() else {}
                 state[role + 'RawExit'] = receipt.get('rawExit')
@@ -410,11 +532,19 @@ def run(out):
                     after = dependency_identity()
                     save(out, 'dependencies-after', after)
                     require(after == deps, 'package/native identity changed')
+                if mapper_tool:
+                    after = {'path': '/usr/bin/vmmap', 'sha256': sha(Path('/usr/bin/vmmap').read_bytes())}
+                    save(out, 'mapper-tool-after', after)
+                    require(after == mapper_tool, 'mapper executable identity changed')
                 require(original and original.receipt['cleanupVerified'], 'original cleanup not proven')
                 raw = (out / 'original.stdout.log').read_text(errors='replace') + (out / 'original.stderr.log').read_text(errors='replace')
                 state['originalVerdict'] = test_verdict(raw, original.receipt)
                 require(sampler is not None, 'sample unavailable')
-                report = validate_report((out / 'sample.txt').read_text(), original.receipt, sampler.receipt, deps['binary'])
+                raw_report = (out / 'sample.txt').read_text()
+                save(out, 'image-diagnostics', image_diagnostics(raw_report, deps['binary']))
+                require(mapper is not None, 'owned map unavailable')
+                report = validate_report(raw_report, original.receipt, sampler.receipt, deps['binary'],
+                                         mapper=mapper.receipt, map_raw=(out / 'mapper.stdout.log').read_text())
                 save(out, 'stack-evidence', report)
                 if state['originalVerdict'] == 'pass':
                     png = out / 'native/pixel-art-big-stroke.png'
@@ -429,14 +559,14 @@ def run(out):
             save(out, 'result', state)
             if MEASUREMENT_SIGNAL:
                 save(out, 'measurement-interruption', {'signal': MEASUREMENT_SIGNAL, 'observed': stamp(),
-                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'],
+                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'], 'mapperRawExit': state['mapperRawExit'],
                      'error': state.get('error'), 'evidenceError': state.get('evidenceError')})
             save(out, 'manifest', {str(p.relative_to(out)): sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
             # A signal delivered while publishing the first manifest is late:
             # preserve that immutable snapshot and add a final inventory.
             if MEASUREMENT_SIGNAL and not (out / 'measurement-interruption.json').exists():
                 save(out, 'measurement-interruption', {'signal': MEASUREMENT_SIGNAL, 'observed': stamp(),
-                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'],
+                     'originalRawExit': state['originalRawExit'], 'samplerRawExit': state['samplerRawExit'], 'mapperRawExit': state['mapperRawExit'],
                      'error': state.get('error'), 'evidenceError': state.get('evidenceError')})
                 save(out, 'terminal-manifest', {str(p.relative_to(out)): sha(p.read_bytes()) for p in out.rglob('*') if p.is_file()})
         finally:

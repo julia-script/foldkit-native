@@ -215,6 +215,7 @@ except m.MeasurementCancelled as error:
     raise SystemExit(143)
 ''',
 }
+SAFE_PROGRAMS['mapper-spawn-registration'] = SAFE_PROGRAMS['measurement-spawn-registration'].replace('registered', 'mapper')
 
 
 def hold_interrupt_stage(stage, out, identity):

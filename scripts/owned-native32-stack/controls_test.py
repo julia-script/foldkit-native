@@ -36,6 +36,22 @@ def receipts():
     return original, sample
 
 
+def mapping_receipts():
+    original, sample = receipts()
+    now = dt.datetime.now(dt.timezone.utc)
+    def when(offset):
+        return {'utc': (now + dt.timedelta(seconds=offset)).isoformat(), 'monotonic': 100 + offset}
+    sample['start'], sample['end'] = when(-2), when(1)
+    sample['targetAtStart'] = row()
+    mapper = {'role': 'mapper', 'argv': ['/usr/bin/vmmap', '-w', '-interleaved', '99991'],
+              'identity': {**row(99993), 'command': '/usr/bin/vmmap'},
+              'rawExit': 0, 'cleanupVerified': True, 'survivors': [], 'signals': [],
+              'targetBefore': row(), 'targetAfter': row(), 'targetBeforeObserved': when(-4),
+              'start': when(-3.9), 'end': when(-3), 'targetAfterObserved': when(-2.9)}
+    raw = 'Process: bun [99991]\n__TEXT 00001000-00001800 [ 2K] r-x/rwx SM=COW ' + BINARY['path'] + '\n'
+    return original, sample, mapper, raw
+
+
 class Controls(unittest.TestCase):
     def setUp(self):
         self.temp = None
@@ -197,6 +213,75 @@ class Controls(unittest.TestCase):
         self.assertIn('not exclusive CPU', value['interpretation'])
         with self.assertRaisesRegex(RuntimeError, 'synthetic'):
             m.validate_report(report(), original, sample, BINARY, synthetic=True)
+
+    def test_redacted_report_requires_owned_map_and_split_diagnostics(self):
+        original, sample, mapper, map_raw = mapping_receipts()
+        raw = report().replace(BINARY['path'], '/Users/*/gpuix-native.darwin-arm64.node')
+        diagnostic = m.image_diagnostics(raw, BINARY)
+        self.assertEqual((diagnostic['nativeRowCount'], diagnostic['matchingUUIDCount'], diagnostic['exactPathCount']), (1, 1, 0))
+        with self.assertRaisesRegex(RuntimeError, 'owned map required'):
+            m.validate_report(raw, original, sample, BINARY)
+        value = m.validate_report(raw, original, sample, BINARY, mapper=mapper, map_raw=map_raw)
+        self.assertEqual(value['ownedMapBridge']['region']['start'], 0x1000)
+        self.assertEqual(value['ownedMapBridge']['region']['end'], 0x1800)
+        self.assertTrue(value['symbolAttributionAvailable'])
+        # The __TEXT end is deliberately different from the whole-image end.
+        self.out.mkdir()
+        m.save(self.out, 'synthetic-owned-map-positive', {'classification': 'synthetic parser bridge only; no physical mapping', 'receipt': value})
+
+    def test_mapping_identity_interval_path_address_protection_negatives(self):
+        original, sample, mapper, map_raw = mapping_receipts()
+        raw = report().replace(BINARY['path'], '/Users/*/gpuix-native.darwin-arm64.node')
+        variants = []
+        for key, value in [('role', 'other'), ('argv', ['/usr/bin/vmmap', '-w', 'process-name']),
+                           ('rawExit', 13), ('cleanupVerified', False), ('survivors', [row()]), ('signals', ['SIGTERM'])]:
+            variants.append((key, {**mapper, key: value}, sample, map_raw, raw, BINARY))
+        for key in ('targetBefore', 'targetAfter'):
+            for field, value in [('pid', 123), ('pgid', 123), ('ppid', 123), ('start', 'stale'), ('command', '/other/bun'), ('state', 'Z')]:
+                variants.append((key + field, {**mapper, key: {**mapper[key], field: value}}, sample, map_raw, raw, BINARY))
+        for field, value in [('ppid', 123), ('pgid', 123), ('start', ''), ('command', '/other/vmmap')]:
+            variants.append(('mapper' + field, {**mapper, 'identity': {**mapper['identity'], field: value}}, sample, map_raw, raw, BINARY))
+        variants.append(('presample-stale', mapper, {**sample, 'targetAtStart': {**row(), 'start': 'stale'}}, map_raw, raw, BINARY))
+        for name, text in [('wrong-header', map_raw.replace('[99991]', '[123]')),
+                           ('duplicate-header', map_raw + 'Process: bun [99991]\n'),
+                           ('denied', 'vmmap: permission denied\n'),
+                           ('wrong-path', map_raw.replace(BINARY['path'], '/wrong/gpuix-native.darwin-arm64.node')),
+                           ('wildcard-path', map_raw.replace(BINARY['path'], '/Users/*/gpuix-native.darwin-arm64.node')),
+                           ('relative-path', map_raw.replace(BINARY['path'], 'gpuix-native.darwin-arm64.node')),
+                           ('duplicate', map_raw + map_raw.split('\n')[1] + '\n'),
+                           ('missing', map_raw.split('\n')[0] + '\n'),
+                           ('base', map_raw.replace('00001000', '00001100')),
+                           ('reversed', map_raw.replace('00001800', '00000001')),
+                           ('writable', map_raw.replace('r-x/rwx', 'rwx/rwx')),
+                           ('nonexecute', map_raw.replace('r-x/rwx', 'r--/rwx')),
+                           ('nonfile', map_raw.replace('SM=COW', 'SM=NUL'))]:
+            variants.append((name, mapper, sample, text, raw, BINARY))
+        late = copy.deepcopy(mapper)
+        late['start'] = sample['end']
+        variants.append(('order', late, sample, map_raw, raw, BINARY))
+        long = copy.deepcopy(mapper)
+        long['start']['monotonic'] -= 10
+        variants.append(('cap', long, sample, map_raw, raw, BINARY))
+        variants.append(('uuid', mapper, sample, map_raw, raw.replace(UUID, 'A' * 36), BINARY))
+        variants.append(('hash', mapper, sample, map_raw, raw, {**BINARY, 'sha256': '0' * 64}))
+        variants.append(('ambiguous-image', mapper, sample, map_raw, raw + raw.split('Binary Images:\n')[1], BINARY))
+        rejected = {}
+        for name, packet, sampling, mapped, report_raw, binary in variants:
+            with self.subTest(name=name), self.assertRaises(RuntimeError) as failure:
+                m.validate_report(report_raw, original, sampling, binary, mapper=packet, map_raw=mapped)
+            rejected[name] = repr(failure.exception)
+        with self.assertRaisesRegex(RuntimeError, 'incomplete'):
+            m.validate_report(raw, original, sample, BINARY, mapper=mapper)
+        self.out.mkdir()
+        m.save(self.out, 'synthetic-map-negatives', {'classification': 'synthetic joint-proof faults only', 'rejected': rejected})
+
+    def test_mapper_command_uses_only_fresh_owned_original(self):
+        target = type('Target', (), {'child': type('Child', (), {'pid': 99991})(), 'receipt': {'lastResources': row()}, 'verified_live': lambda self: row()})()
+        self.assertEqual(m.mapper_command(target), ['/usr/bin/vmmap', '-w', '-interleaved', '99991'])
+        for field, value in [('ppid', 123), ('pgid', 123), ('start', 'stale'), ('command', 'other'), ('state', 'Z')]:
+            target.receipt['lastResources'] = {**row(), field: value}
+            with self.assertRaises(RuntimeError):
+                m.mapper_command(target)
 
     def test_positive_structural_stacks_and_native_attribution(self):
         original, sample = receipts()
@@ -383,6 +468,56 @@ class Controls(unittest.TestCase):
         self.assertIn('PermissionError', receipt['spawnOrIdentityError'])
         self.assertFalse((self.out / 'original-process.json').exists())
 
+    def test_mapper_permission_spawn_failure_is_separate_and_honest(self):
+        self.out.mkdir()
+        argv = ['/usr/bin/vmmap', '-w', '-interleaved', '99991']
+        with self.assertRaises(PermissionError):
+            m.Owned(argv, self.out, 'mapper', os.environ.copy(), factory=lambda *a, **k: (_ for _ in ()).throw(PermissionError('synthetic denied permission')))
+        receipt = json.loads((self.out / 'mapper-process.json').read_text())
+        self.assertEqual(receipt['argv'], argv)
+        self.assertIsNone(receipt['rawExit'])
+        self.assertFalse(receipt['cleanupVerified'])
+        self.assertIn('PermissionError', receipt['spawnOrIdentityError'])
+        self.assertFalse((self.out / 'original-process.json').exists())
+
+    def test_mapper_role_harmless_descendant_cleanup(self):
+        child = self.spawn_harmless('descendant', 'mapper')
+        try:
+            child.observe()
+            self.assertGreaterEqual(len(child.receipt['observedGroupMembers']), 2)
+            with self.assertRaises(subprocess.TimeoutExpired):
+                child.child.wait(timeout=.1)
+        finally:
+            receipt = child.close()
+            m.save(self.out, 'mapper-process', receipt)
+        self.assertEqual(receipt['rawExit'], -15)
+        self.assertTrue(receipt['cleanupVerified'])
+        self.assertEqual(receipt['survivors'], [])
+        self.assertNotIn(child, m.ACTIVE_OWNED)
+
+    def test_mapper_role_harmless_spawn_registration_interruption(self):
+        self.out.mkdir()
+        out = self.out / 'registration'
+        argv = [sys.executable, '-c', safe.SAFE_PROGRAMS['mapper-spawn-registration']]
+        m.save(self.out, 'mapper-registration-allowlist', safe.harmless(argv))
+        child = m.Owned(argv, self.out, 'mapper-registration-supervisor',
+                        {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'FOLDKIT_SAFE_MEASUREMENT_OUT': str(out)})
+        try:
+            child.child.wait(timeout=10)
+        finally:
+            receipt = child.close()
+            m.save(self.out, 'mapper-registration-supervisor-process', receipt)
+        self.assertEqual(receipt['rawExit'], 143)
+        self.assertTrue(receipt['cleanupVerified'])
+        result = json.loads((out / 'result.json').read_text())
+        self.assertEqual(result['signal'], 15)
+        self.assertEqual(result['receipt']['role'], 'mapper')
+        self.assertEqual(result['receipt']['rawExit'], -15)
+        self.assertTrue(result['receipt']['cleanupVerified'])
+        self.assertEqual(result['knownLiveAfter'], [])
+        for relative, digest in json.loads((out / 'manifest.json').read_text()).items():
+            self.assertEqual(m.sha((out / relative).read_bytes()), digest)
+
     def test_unknown_cleanup_member_fails_honestly_without_signal(self):
         obj = object.__new__(m.Owned)
         obj.child = type('Child', (), {'pid': 99991})()
@@ -520,18 +655,24 @@ class Controls(unittest.TestCase):
         class FakeChild:
             def __init__(self, argv, out, role, env):
                 self.role, self.count = role, 0
-                self.receipt = {'role': role, 'argv': argv, 'identity': row(), 'start': m.stamp(), 'end': m.stamp(),
-                                'rawExit': original_exit if role == 'original' else sampler_exit, 'cleanupVerified': True}
+                self.closed = False
+                identity = row(99993) if role == 'mapper' else row()
+                if role == 'mapper':
+                    identity['command'] = '/usr/bin/vmmap'
+                self.receipt = {'role': role, 'argv': argv, 'identity': identity, 'lastResources': row(), 'start': m.stamp(), 'end': m.stamp(),
+                                'rawExit': original_exit if role == 'original' else (13 if mode == 'mapper-fail' else -15 if mode == 'mapper-timeout' else 0) if role == 'mapper' else sampler_exit,
+                                'cleanupVerified': True, 'survivors': [], 'signals': []}
                 self.child = self
-                self.pid = 99991 if role == 'original' else 99992
+                self.pid = 99991 if role == 'original' else 99993 if role == 'mapper' else 99992
                 verdict = '(fail)' if original_exit else '(pass)'
-                (out / (role + '.stdout.log')).write_text('native test window: {"name":"pixel-art","actual":{"width":760,"height":653}}\n' + verdict + ' Metal, offscreen > ' + m.TITLE + '\n33 expect() calls\n')
+                stdout = mapping_receipts()[3] if role == 'mapper' else 'native test window: {"name":"pixel-art","actual":{"width":760,"height":653}}\n' + verdict + ' Metal, offscreen > ' + m.TITLE + '\n33 expect() calls\n'
+                (out / (role + '.stdout.log')).write_text('synthetic denied/malformed' if role == 'mapper' and mode == 'mapper-malformed' else stdout)
                 (out / (role + '.stderr.log')).write_text('synthetic original error' if role == 'original' else 'synthetic permission denied')
             def poll(self):
                 self.count += 1
                 if mode == 'early-original' and self.role == 'original':
                     return self.receipt['rawExit']
-                if mode in ('original-timeout', 'sampler-timeout'):
+                if mode == 'original-timeout' or mode == 'sampler-timeout' and self.role != 'mapper' or mode == 'mapper-timeout' and self.role in ('original', 'mapper'):
                     return None
                 return None if self.role == 'original' and self.count <= 3 else self.receipt['rawExit']
             def wait(self, timeout):
@@ -543,13 +684,17 @@ class Controls(unittest.TestCase):
             def verified_live(self):
                 return row()
             def close(self):
+                if not self.closed:
+                    self.receipt['end'] = m.stamp()
+                    self.closed = True
                 return self.receipt
         source = {'head': 'synthetic-source'}
         deps = {'binary': BINARY}
         cases = [(17, 13, 'raw-fail'), (0, 13, 'sample-fail'), (0, 0, 'missing-report'),
                  (-15, 0, 'original-timeout'), (0, -15, 'sampler-timeout'),
                  (0, -15, 'sampler-wait-timeout'), (17, None, 'early-original'),
-                 (0, 0, 'source-drift'), (0, 0, 'binary-drift'), (17, 13, 'terminal-interrupt')]
+                 (0, 0, 'source-drift'), (0, 0, 'binary-drift'), (17, 13, 'terminal-interrupt'),
+                 (17, None, 'mapper-fail'), (0, None, 'mapper-malformed'), (0, None, 'mapper-timeout')]
         for original_exit, sampler_exit, mode in cases:
             out = self.out / mode
             limits = {**m.LIMITS}
@@ -567,17 +712,23 @@ class Controls(unittest.TestCase):
                  patch.object(m, 'source_identity', side_effect=[source, source_after]), patch.object(m, 'dependency_identity', side_effect=[deps, deps_after]), \
                  patch.object(m, 'read_command', side_effect=lambda argv: '1.3.9' if argv[0] == 'bun' else 'v22.22.3' if argv[0] == 'node' else 'synthetic nm'), \
                  patch.object(m, 'Owned', FakeChild), patch.object(m, 'LIMITS', limits), \
+                 patch.object(m, 'MAPPER_SECONDS', -1 if mode == 'mapper-timeout' else 5), \
                  patch.object(m, 'MEASUREMENT_SIGNAL', 15 if mode == 'terminal-interrupt' else None):
                 actual_exit = m.run(out)
                 self.assertEqual(actual_exit, 128 - original_exit if original_exit < 0 else original_exit or 1, (out / 'result.json').read_text())
             result = json.loads((out / 'result.json').read_text())
             self.assertEqual(result['originalRawExit'], original_exit)
-            self.assertEqual(result['samplerRawExit'], None if mode in ('early-original', 'original-timeout') else sampler_exit)
+            self.assertEqual(result['samplerRawExit'], None if mode in ('early-original', 'original-timeout', 'mapper-fail', 'mapper-malformed', 'mapper-timeout') else sampler_exit)
+            self.assertEqual(result['mapperRawExit'], None if mode in ('early-original', 'original-timeout') else 13 if mode == 'mapper-fail' else -15 if mode == 'mapper-timeout' else 0)
             self.assertEqual(result['originalVerdict'], 'unproved' if mode in ('source-drift', 'binary-drift') else 'fail' if original_exit else 'pass')
             if mode == 'original-timeout':
                 self.assertTrue(result['originalEnvelopeExceeded'])
             if mode == 'sampler-timeout':
                 self.assertTrue(result['samplerEnvelopeExceeded'])
+            if mode == 'mapper-timeout':
+                self.assertTrue(result['mapperEnvelopeExceeded'])
+            if mode in ('mapper-fail', 'mapper-malformed', 'mapper-timeout'):
+                self.assertFalse((out / 'sampler-process.json').exists())
             if mode in ('sampler-wait-timeout', 'original-timeout', 'sampler-timeout'):
                 self.assertIn('Timeout', result['error'])
             if mode == 'early-original':
