@@ -134,11 +134,30 @@ def close_step(child, nested, out, role, result):
     finally:
         m.DEFER_CANCELLATION = previous
 
+CHILD_READY = '''import os,sys,time,json
+from pathlib import Path
+sys.path.insert(0,str(Path.cwd()/'scripts/owned-native32-stack'))
+import measure as m
+channel=Path(os.environ['FOLDKIT_SAFE_CHILD_HANDSHAKE']).resolve()
+assert not channel.is_relative_to(m.ROOT)
+m.save(channel,'ready',{'pid':os.getpid(),'parentPID':os.getppid()})
+'''
+CHILD_WAIT = '''deadline=time.monotonic()+20
+while not (channel/'release.json').exists():
+    if time.monotonic()>=deadline:
+        raise TimeoutError('harmless child release not received')
+    time.sleep(.01)
+release=json.loads((channel/'release.json').read_text())
+assert release['parentPID']==os.getppid()
+assert release['identity']==m.token(m.table()[os.getpid()])
+m.save(channel,'acknowledged',release)
+'''
+
 SAFE_PROGRAMS = {
-    'success': 'import time; print("harmless-owned",flush=True); time.sleep(.15)',
-    'failure': 'import time; time.sleep(.15); raise SystemExit(17)',
-    'hang': 'import time; time.sleep(20)',
-    'descendant': 'import subprocess,sys,time; subprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"]); print("owned-descendant",flush=True); time.sleep(20)',
+    'success': CHILD_READY + CHILD_WAIT + 'raise SystemExit(0)',
+    'failure': CHILD_READY + CHILD_WAIT + 'raise SystemExit(17)',
+    'hang': CHILD_READY + CHILD_WAIT,
+    'descendant': CHILD_READY + 'import subprocess\nsubprocess.Popen([sys.executable,"-c","import time; time.sleep(20)"])\n' + CHILD_WAIT,
     'measurement-publication': '''import os,sys,runpy,signal,subprocess
 from pathlib import Path
 out=Path(os.environ['FOLDKIT_SAFE_MEASUREMENT_OUT']).resolve()
@@ -198,6 +217,20 @@ except m.MeasurementCancelled as error:
 }
 
 
+def hold_interrupt_stage(stage, out, identity):
+    selected = os.environ.get('FOLDKIT_SAFE_INTERRUPT_STAGE')
+    m.require(selected in (None, 'controls', 'hang', 'descendant'), 'invalid harmless interruption stage')
+    if selected != stage:
+        return
+    m.save(out, stage + '-awaiting-interruption', {'stage': stage, 'identity': identity,
+           'classification': 'bounded harmless stage hold, not native evidence', 'start': m.stamp()})
+    until = time.monotonic() + 20
+    while time.monotonic() < until:
+        check_cancellation()
+        time.sleep(.01)
+    raise TimeoutError('required harmless stage received no interruption')
+
+
 def harmless(argv):
     m.require(len(argv) == 3 and argv[:2] == [sys.executable, '-c'] and argv[2] in SAFE_PROGRAMS.values(), 'non-allowlisted preparation child')
     return {'argv': argv, 'sourceSHA256': m.sha(argv[2].encode()), 'classification': 'harmless Python, not native evidence'}
@@ -228,6 +261,7 @@ def execute(out, head, plan=None):
     try:
         plan = plan if plan is not None else default_plan()
         evidence = audit(plan, head)  # ALL steps/source identities, before ANY test child.
+        m.require(os.environ.get('FOLDKIT_SAFE_INTERRUPT_STAGE') in (None, 'controls', 'hang', 'descendant'), 'invalid harmless interruption stage')
         m.save(out, 'audit', evidence)
         cases = out / 'control-cases'
         cases.mkdir(exist_ok=False)

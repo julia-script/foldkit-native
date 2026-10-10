@@ -210,7 +210,31 @@ class Controls(unittest.TestCase):
         self.out.mkdir(exist_ok=True)
         argv = [sys.executable, '-c', safe.SAFE_PROGRAMS[program]]
         m.save(self.out, role + '-allowlist', safe.harmless(argv))  # Before each child.
-        return m.Owned(argv, self.out, role, {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1'})
+        channel = self.out / (role + '-handshake')
+        channel.mkdir(exist_ok=False)
+        child = m.Owned(argv, self.out, role, {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1',
+                        'FOLDKIT_SAFE_CHILD_HANDSHAKE': str(channel)})
+        try:
+            until = time.monotonic() + 20
+            ready = channel / 'ready.json'
+            while not ready.exists():
+                m.require(child.child.poll() is None, 'harmless child exited before readiness')
+                m.require(time.monotonic() < until, 'harmless child readiness timed out')
+                time.sleep(.01)
+            packet = json.loads(ready.read_text())
+            identity = child.verified_live()
+            m.require(packet == {'pid': child.child.pid, 'parentPID': os.getpid()}, 'wrong harmless ready identity')
+            observed = {'parentPID': os.getpid(), 'identity': m.token(identity), 'observed': m.stamp()}
+            m.save(channel, 'parent-observed', observed)
+            if program in ('success', 'failure'):
+                # Release only AFTER actual live identity has been observed.
+                m.save(channel, 'release', observed)
+            return child
+        except BaseException:
+            receipt = child.close()
+            if not (self.out / (role + '-process.json')).exists():
+                m.save(self.out, role + '-process', receipt)
+            raise
 
     def test_real_harmless_natural_zero_and_raw_failure_owned_cleanup(self):
         for program, expected in [('success', 0), ('failure', 17)]:
@@ -222,6 +246,40 @@ class Controls(unittest.TestCase):
             self.assertIsNotNone(receipt['identity'], receipt)
             self.assertTrue(receipt['cleanupVerified'], receipt)
             self.assertFalse(receipt['survivors'])
+            channel = self.out / (program + '-handshake')
+            released = json.loads((channel / 'release.json').read_text())
+            self.assertEqual(json.loads((channel / 'acknowledged.json').read_text()), released)
+            self.assertEqual(released['identity'], m.token(receipt['identity']))
+
+    def test_raw17_waits_for_observed_identity_even_with_delayed_inspection(self):
+        actual_table = m.table
+        def delayed_table():
+            time.sleep(.2)  # Deliberately slower than the rejected old .15s exit.
+            return actual_table()
+        with patch.object(m, 'table', side_effect=delayed_table):
+            child = self.spawn_harmless('failure', 'slow-failure')
+        try:
+            child.child.wait(timeout=5)
+        finally:
+            receipt = child.close()
+            m.save(self.out, 'slow-failure-process', receipt)
+        self.assertEqual(receipt['rawExit'], 17)
+        self.assertIsNotNone(receipt['identity'])
+        self.assertTrue(receipt['cleanupVerified'])
+        channel = self.out / 'slow-failure-handshake'
+        observed = json.loads((channel / 'parent-observed.json').read_text())
+        self.assertEqual(observed, json.loads((channel / 'acknowledged.json').read_text()))
+        self.assertEqual(observed['identity'], m.token(receipt['identity']))
+
+    def test_required_interrupt_stage_timeout_and_invalid_stage_reject(self):
+        self.out.mkdir()
+        with patch.dict(os.environ, {'FOLDKIT_SAFE_INTERRUPT_STAGE': 'hang'}), \
+             patch.object(time, 'monotonic', side_effect=[0, 21]), patch.object(m, 'stamp', return_value={'synthetic': True}), \
+             self.assertRaisesRegex(TimeoutError, 'received no interruption'):
+            safe.hold_interrupt_stage('hang', self.out, row())
+        with patch.dict(os.environ, {'FOLDKIT_SAFE_INTERRUPT_STAGE': 'missing'}), \
+             self.assertRaisesRegex(RuntimeError, 'invalid'):
+            safe.hold_interrupt_stage('hang', self.out, row())
 
     def test_real_harmless_timeout_and_known_descendant_cleanup(self):
         for program in ('hang', 'descendant'):
@@ -232,6 +290,7 @@ class Controls(unittest.TestCase):
                 child.observe()
                 if program == 'descendant':
                     self.assertGreaterEqual(len(child.receipt['observedGroupMembers']), 2)
+                safe.hold_interrupt_stage(program, self.out, child.verified_live())
             finally:
                 receipt = child.close()
                 m.save(self.out, program + '-process', receipt)
@@ -476,6 +535,12 @@ if __name__ == '__main__':
     safe.install_cancellation()
     code = 1
     try:
+        saved = os.environ.get('FOLDKIT_NATIVE32_SAFE_CONTROLS_EVIDENCE')
+        if os.environ.get('FOLDKIT_SAFE_INTERRUPT_STAGE') == 'controls':
+            m.require(saved, 'missing harmless controls evidence root')
+            current = m.table().get(os.getpid())
+            m.require(current and current['pgid'] == os.getpid(), 'unverified control stage identity')
+            safe.hold_interrupt_stage('controls', Path(saved).parent, current)
         code = 0 if unittest.main(exit=False).result.wasSuccessful() else 1
     except safe.Cancelled as interruption:
         code = 128 + interruption.signum

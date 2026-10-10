@@ -42,11 +42,13 @@ def probe(out, head):
             child = None
             evidence = {'stage': stage, 'known': {}, 'passed': False}
             try:
-                child = m.Owned(planned[stage], case, 'supervisor', dict(os.environ))
+                child = m.Owned(planned[stage], case, 'supervisor',
+                                {**os.environ, 'FOLDKIT_SAFE_INTERRUPT_STAGE': stage})
                 evidence['supervisorInitial'] = copy.deepcopy(child.receipt)
                 prep = case / 'preparation'
                 started = prep / 'controls-started.json' if stage == 'controls' else (
                     prep / 'control-cases/test_real_harmless_timeout_and_known_descendant_cleanup/evidence' / (stage + '-started.json'))
+                held = prep / 'controls-awaiting-interruption.json' if stage == 'controls' else started.parent / (stage + '-awaiting-interruption.json')
                 until = time.monotonic() + 30
                 while child.child.poll() is None and time.monotonic() < until:
                     rows = m.table()
@@ -56,10 +58,12 @@ def probe(out, head):
                     m.require(all(pid not in evidence['known'] or evidence['known'][pid] == token
                                   for pid, token in observed.items()), 'reused owned identity during probe')
                     evidence['known'].update(observed)
-                    if started.exists():
+                    if started.exists() and held.exists():
                         packet = json.loads(started.read_text())
+                        waiting = json.loads(held.read_text())
                         target = rows.get(packet['identity']['pid']) if packet['identity'] else None
                         if target and not target['state'].startswith('Z') and m.token(target) == m.token(packet['identity']):
+                            m.require(waiting['stage'] == stage and m.token(waiting['identity']) == m.token(target), 'wrong held stage identity')
                             m.require(target['pid'] in evidence['known'], 'started fixture is not an owned descendant')
                             expected = safe.default_plan()[0] if stage == 'controls' else [sys.executable, '-c', safe.SAFE_PROGRAMS[stage]]
                             m.require(packet['argv'] == expected, 'non-allowlisted interruption target')
