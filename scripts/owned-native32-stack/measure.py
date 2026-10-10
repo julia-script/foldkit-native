@@ -120,6 +120,8 @@ class Owned:
         self.out, self.closed = out, False
         self.receipt = {'role': role, 'argv': argv, 'start': stamp(), 'rawExit': None,
                         'signals': [], 'cleanupVerified': False, 'survivors': [], 'identity': None}
+        if CANCELLATION_CHECK:
+            CANCELLATION_CHECK()
         self.stdout = (out / (role + '.stdout.log')).open('x')
         self.stderr = (out / (role + '.stderr.log')).open('x')
         try:
@@ -179,8 +181,11 @@ class Owned:
                 require(not [r for r in table().values() if r['pgid'] == self.child.pid and not r['state'].startswith('Z')], 'owned signal denied with live members')
 
     def close(self, grace_seconds=2):
+        global DEFER_CANCELLATION
         if self.closed:
             return self.receipt
+        previous = DEFER_CANCELLATION
+        DEFER_CANCELLATION = True
         try:
             if self.child:
                 if self.child.poll() is None:
@@ -211,6 +216,7 @@ class Owned:
             self.receipt['end'] = stamp()
             self.stdout.close()
             self.stderr.close()
+            DEFER_CANCELLATION = previous
         return self.receipt
 
 

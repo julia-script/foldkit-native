@@ -70,7 +70,7 @@ def observe_nested(child, known):
     for _ in range(len(rows)):
         added = False
         for pid, row in rows.items():
-            if row['ppid'] in parents and pid not in parents:
+            if row['ppid'] in parents and pid not in parents and not row['state'].startswith('Z'):
                 m.require(pid not in known or known[pid] == m.token(row), 'reused nested preparation identity')
                 known[pid] = m.token(row)
                 parents.add(pid)
