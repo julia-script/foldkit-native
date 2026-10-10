@@ -34,22 +34,28 @@ afterEach(async () => {
 for (const automation of [false, true]) {
   test(`shutdown preserves host stdin listeners before and after mount, automation=${automation}`, async () => {
     const delivered: Array<string> = []
-    const before = listen(() => delivered.push('before'))
+    // Identity distinguishes these empty test-owned chunks from real stdin.
+    // Empty chunks invoke the host without sending an automation command.
+    const beforeClose = Buffer.from(''), afterClose = Buffer.from('')
+    const record = (host: string) => (chunk: unknown) => {
+      if (chunk === beforeClose) delivered.push(`${host}:before-close`)
+      if (chunk === afterClose) delivered.push(`${host}:after-close`)
+    }
+    const before = listen(record('before'))
     const original = process.stdin.listeners('data')
     const { app } = open({ automation })
     const owned = process.stdin.listeners('data').filter(listener => !original.includes(listener))
     expect(owned.length).toBe(automation ? 1 : 0)
-    const after = listen(() => delivered.push('after'))
-    // Empty data invokes the host listeners without sending an automation command.
-    process.stdin.emit('data', Buffer.from(''))
-    expect(delivered).toEqual(['before', 'after'])
+    const after = listen(record('after'))
+    process.stdin.emit('data', beforeClose)
+    expect(delivered).toEqual(['before:before-close', 'after:before-close'])
     expect(await app.close()).toBe(true)
     await app.closed
     expect(process.stdin.listeners('data')).toContain(before)
     expect(process.stdin.listeners('data')).toContain(after)
     for (const listener of owned) expect(process.stdin.listeners('data')).not.toContain(listener)
-    process.stdin.emit('data', Buffer.from(''))
-    expect(delivered).toEqual(['before', 'after', 'before', 'after'])
+    process.stdin.emit('data', afterClose)
+    expect(delivered).toEqual(['before:before-close', 'after:before-close', 'before:after-close', 'after:after-close'])
   })
 }
 
