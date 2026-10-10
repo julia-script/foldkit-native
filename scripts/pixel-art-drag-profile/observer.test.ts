@@ -112,3 +112,24 @@ test('overlapping async settle calls are rejected as incomplete observation', as
   await held
   expect(observer.snapshot().faults).toContain('overlapping settle calls')
 })
+
+test('timer observer preserves omitted delay, scheduler receiver, handles and callback behavior', () => {
+  const observer = createObserver()
+  let scheduled: unknown[] = []
+  const handle = {}
+  const target = { setTimeout: function(this: unknown, ...args: unknown[]) {
+    expect(this).toBe(target); scheduled = args; return handle
+  } as unknown as typeof setTimeout }
+  observer.instrumentTimers(target)
+  const receiver = {}
+  const returned = {}
+  const callback = function(this: unknown, value: unknown) { expect(this).toBe(receiver); expect(value).toBe(returned); return returned }
+  expect(Object.is(target.setTimeout(callback), handle)).toBe(true)
+  expect(scheduled).toHaveLength(1)
+  expect(Reflect.apply(scheduled[0] as Function, receiver, [returned])).toBe(returned)
+  const error = new Error('original callback failure')
+  target.setTimeout(() => { throw error }, 12, returned)
+  expect(scheduled.slice(1)).toEqual([12, returned])
+  try { Reflect.apply(scheduled[0] as Function, receiver, []); throw new Error('did not throw') } catch (caught) { expect(caught).toBe(error) }
+  observer.restore()
+})

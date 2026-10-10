@@ -109,8 +109,9 @@ export const createObserver = (onClose: () => void = () => {}) => {
     const scheduled = target.setTimeout
     // Preserve handles, delay/extra arguments, callback receiver and thrown
     // errors. Only observe timers already scheduled by the unchanged code.
-    target.setTimeout = function(this: unknown, callback: TimerHandler, delay?: number, ...args: any[]) {
-      if (typeof callback !== 'function') return Reflect.apply(scheduled, this, [callback, delay, ...args])
+    target.setTimeout = function(this: unknown, callback: TimerHandler, ...tail: any[]) {
+      if (typeof callback !== 'function') return Reflect.apply(scheduled, this, [callback, ...tail])
+      const delay = tail[0]
       const started = performance.now()
       const timerPhase = phase
       const timerCycle = settling && delay === 0 ? cycle + 1 : 0
@@ -126,7 +127,7 @@ export const createObserver = (onClose: () => void = () => {}) => {
         try { return Reflect.apply(observe(`timer.callback.${delay ?? 0}`, callback as (...args: unknown[]) => unknown), this, values) }
         finally { phase = previousPhase; cycle = previousCycle }
       }
-      return Reflect.apply(scheduled, this, [wrapped, delay, ...args])
+      return Reflect.apply(scheduled, this, [wrapped, ...tail])
     } as typeof setTimeout
   }
   return {
