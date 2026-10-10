@@ -60,6 +60,37 @@ jobs:
           export XDG_DATA_HOME="$RUNNER_TEMP/linux-privacy-data"
           export TMPDIR="$evidence/session"
           mkdir -p "$evidence" "$TMPDIR" "$XDG_DATA_HOME"
+          printf 'preflight-start\nexpected_head=%s\ndeclared_icd=%s\n' \
+            "$QUALIFICATION_HEAD" "$VK_DRIVER_FILES" > "$evidence/preflight.log"
+          preflight_failure() {
+            local status="$1" line="$2" failed_command="$3"
+            trap - ERR
+            printf 'preflight-failure status=%s line=%s command=%s\n' \
+              "$status" "$line" "$failed_command" >&2 || true
+            printf 'preflight-failure status=%s line=%s command=%s\n' \
+              "$status" "$line" "$failed_command" >> "$evidence/preflight.log" || true
+            exit "$status"
+          }
+          trap 'preflight_failure "$?" "$LINENO" "$BASH_COMMAND"' ERR
+          # Diagnostics do not replace or relax any guard below.
+          {
+            printf 'actual_head\n'
+            git rev-parse HEAD || true
+            printf 'reviewed_source_objects\n'
+            for target in packages/foldkit-gpuix/src src \
+              packages/foldkit-gpuix/test/automation-secrets-native.test.ts \
+              packages/foldkit-gpuix/test/secret-stale-native-app.ts \
+              package-lock.json scripts/wayland-session.sh; do
+              printf '%s=' "$target"
+              git rev-parse "HEAD:$target" || true
+            done
+            printf 'runtime\n'
+            uname -sm || true
+            bun --version || true
+            node --version || true
+            printf 'installed_icd_manifest\n'
+            dpkg-query -L mesa-vulkan-drivers || true
+          } >> "$evidence/preflight.log" 2>&1
           install -d -m 700 "$XDG_RUNTIME_DIR"
           test "$(git rev-parse HEAD)" = "$QUALIFICATION_HEAD"
           # Full production trees, original macOS painted fixture, lock and
@@ -102,6 +133,7 @@ jobs:
             exit 1
           fi
           dpkg-query -W sway grim mesa-vulkan-drivers libvulkan1 libegl1 libxkbcommon0 > "$evidence/system-packages.log"
+          trap - ERR
           cat > "$evidence/command.sh" <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
