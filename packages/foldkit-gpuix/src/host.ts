@@ -416,10 +416,17 @@ export const createHost = (document: NativeDocument, options: HostOptions) => {
         aspects.delete(element)
         continue
       }
+      const fittingAvailable = guard.open('tree')
       const box = boundsOf(element)
-      if (box === null || box.width === 0) continue
+      if (box === null || box.width === 0) {
+        fittedAspectRatios.delete(element)
+        continue
+      }
       const height = Math.round((box.width / ratio) * 100) / 100
-      fittedAspectRatios.set(element, ratio)
+      // Original fitting may use the last layout during a guard hold. That
+      // cached answer cannot establish resolution for future paint batches.
+      if (fittingAvailable && !guard.holding) fittedAspectRatios.set(element, ratio)
+      else fittedAspectRatios.delete(element)
       if (aspectHeights.get(element) === height) continue
       aspectHeights.set(element, height)
       dirty.add(element)

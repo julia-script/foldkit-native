@@ -151,6 +151,68 @@ test('global aspect fallback rejects a cached height until the current ratio can
   expect(app.host.geometry().reads).toBe(reads)
 })
 
+for (const unavailable of ['zero', 'missing', 'failed', 'spaced'] as const) {
+  test(`unchanged ratio recovers after width fitting encounters ${unavailable} bounds`, async () => {
+    const run = async (baseline: boolean) => {
+      let clock = 0
+      let app: Headless | undefined
+      app = mountHeadless({ now: () => clock, onSynced: ({ mutations }) => {
+        if (baseline && mutations > 0) app?.host.relayout()
+      } })
+      opened.push(app)
+      const cell = app.document.createElement('div')
+      cell.setAttribute('style', `width:100px;aspect-ratio:1;background-color:${white}`)
+      app.container.appendChild(cell as never); app.host.flush()
+      app.gpui.setBounds(cell.nativeId, { x: 0, y: 0, width: 100, height: 100 })
+      const cycles = async (count: number) => {
+        for (let i = 0; i < count; i++) {
+          await new Promise(resolve => setTimeout(resolve, 0))
+          clock += 5; app!.host.frame(); app!.host.flush(); app!.host.drawn()
+        }
+      }
+      await cycles(8)
+      expect(app.gpui.node(cell.nativeId).style['height']).toBe(100)
+      // This fixture spreads the repo fake, which supplies the tree reader.
+      const renderer = app.fake.renderer as typeof app.fake.renderer & { getAutomationTree: () => string }
+      const tree = renderer.getAutomationTree
+      if (unavailable === 'zero') app.gpui.setBounds(cell.nativeId, { x: 0, y: 0, width: 0, height: 0 })
+      else renderer.getAutomationTree = function () {
+        if (unavailable === 'failed') throw new Error('owned missing native answer')
+        if (unavailable === 'spaced') { clock += 20; return tree.call(this) }
+        const root = JSON.parse(tree.call(this))
+        type TreeNode = { id: number; bounds?: unknown; children?: Array<TreeNode> }
+        const removeBounds = (node: TreeNode) => {
+          if (node.id === cell.nativeId) delete node.bounds
+          node.children?.forEach(removeBounds)
+        }
+        removeBounds(root)
+        return JSON.stringify(root)
+      }
+      cell.style.setProperty('width', '200px'); app.host.flush()
+      await cycles(8)
+      expect(app.gpui.node(cell.nativeId).style['height']).toBe(100)
+      if (unavailable === 'failed') expect(app.host.geometry().holding).toBe(true)
+      if (unavailable === 'spaced') expect(app.host.geometry().skipped).toBeGreaterThan(0)
+      renderer.getAutomationTree = tree
+      app.gpui.setBounds(cell.nativeId, { x: 0, y: 0, width: 200, height: 100 })
+      if (unavailable === 'failed') {
+        // Preserve the existing guard's backoff and input requirement.
+        clock += 1100
+        app.host.dispatch({ eventType: 'mouseMove', elementId: cell.nativeId, x: 10, y: 10 })
+      }
+      if (unavailable === 'spaced') clock += 80
+      const start = app.gpui.batches.length
+      cell.style.setProperty('background-color', ink); app.host.flush()
+      await cycles(4)
+      return { height: app.gpui.node(cell.nativeId).style['height'], commands: app.gpui.batches.slice(start) }
+    }
+    const original = await run(true)
+    const candidate = await run(false)
+    expect(original.height).toBe(200)
+    expect(candidate).toEqual(original)
+  })
+}
+
 for (const action of ['width removal', 'text', 'structure', 'listener', 'custom prop', 'reorder'] as const) {
   test(`unknown/mixed batch retains geometry invalidation: ${action}`, () => {
     const { app, cell, frame, color } = make()
