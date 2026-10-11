@@ -13,6 +13,8 @@ const before = {
   signals: ['SIGTERM', 'SIGINT'].map(name => process.listeners(name)),
 }
 // Import installed exports, including every existing root subpath. No aliases.
+const binding = await import('@gpuix/native')
+assert.equal(typeof binding.GpuixRenderer, 'function')
 const native = await import('foldkit-native')
 const primitives = await import('foldkit-native/primitives')
 const theme = await import('foldkit-native/theme')

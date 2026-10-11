@@ -11,6 +11,8 @@ export function checkPackages(destination, keep = false) {
   const consumer = mkdtempSync(join(tmpdir(), 'foldkit-package-consumer-'))
   const environment = { ...process.env }
   delete environment.NODE_PATH
+  delete environment.NODE_OPTIONS
+  delete environment.BUN_OPTIONS
   delete environment.TS_NODE_PROJECT
   const execute = (file, args) => execFileSync(file, args, {
     cwd: consumer, env: environment, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'],
